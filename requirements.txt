@@ -1,0 +1,7 @@
+breeze-connect
+schedule
+pandas
+numpy
+bharat-sm-data
+yfinance
+nsepy

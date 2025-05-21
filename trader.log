@@ -1,0 +1,4 @@
+2025-05-22 01:40:02,209 - ERROR - Failed to initialize API: Unexpected error: Session key is expired.
+2025-05-22 01:40:02,210 - ERROR - Failed to initialize API. Exiting.
+2025-05-22 01:43:11,842 - ERROR - Failed to initialize API: Unexpected error: Session key is expired.
+2025-05-22 01:43:11,844 - ERROR - Failed to initialize API. Exiting.
