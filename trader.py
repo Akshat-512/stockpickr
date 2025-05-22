@@ -591,7 +591,7 @@ def get_current_price(stock_code, exchange_code="NSE", max_retries=3):
                 err in error_msg.lower()
                 for err in ["error_exception", "nonetype", "503", "timeout"]
             ):
-                logging.warning(
+                logging.debug(
                     f"Temporary error for {stock_code} (attempt {retry_count + 1}/{max_retries}): {error_msg}"
                 )
                 retry_count += 1
@@ -1058,7 +1058,7 @@ def check_sell_signal(df, entry_price):
         # Final decision
         if exit_reasons:
             reason = ", ".join(exit_reasons)
-            logging.info(f"Mid-term sell signal detected: {reason}")
+            logging.warning(f"Mid-term sell signal detected for {stock_code}: {reason}")
             return True, reason
 
         return False, "No mid-term sell criteria met"
@@ -1078,7 +1078,7 @@ def enter_position(stock_code, exchange_code="NSE"):
     Returns:
         bool: True if successful, False otherwise
     """
-    global positions
+    global positions, today_trades
 
     # Validate stock symbol
     if stock_code.startswith(("NIFTY", "SENSEX", "BANKNIFTY")):
@@ -1087,10 +1087,6 @@ def enter_position(stock_code, exchange_code="NSE"):
 
     # Convert to Breeze-compatible symbol
     breeze_symbol = stock_mapper.get_breeze_symbol(stock_code)
-
-    # Log the conversion for debugging
-    if breeze_symbol != stock_code:
-        logging.info(f"Using Breeze symbol {breeze_symbol} for {stock_code}")
 
     # Enhanced position check to prevent duplicate entries
     if stock_code in positions:
@@ -1101,15 +1097,7 @@ def enter_position(stock_code, exchange_code="NSE"):
         logging.info(
             f"PAPER TRADING MODE: Would enter position in {stock_code} (Breeze: {breeze_symbol})"
         )
-        # Even in paper trading mode, update the positions dictionary
-        positions[stock_code] = {
-            "exchange": exchange_code,
-            "quantity": 1,  # Placeholder
-            "entry_price": 0,
-            "entry_time": datetime.datetime.now().isoformat(),
-            "stop_loss": 0,
-        }
-        return True  # Return True to simulate successful order
+        return True
 
     try:
         # Get current price
@@ -1189,45 +1177,72 @@ def enter_position(stock_code, exchange_code="NSE"):
                 order_status = breeze.get_order_detail(
                     order_id=order_id, exchange_code=exchange_code or "NSE"
                 )
+                logging.info(f"Order details: {order_status}")
 
-                # Handle Breeze API's status codes
-                status_code = str(order_status) if order_status else "Unknown"
+                # Check if we got a valid response with Success list
+                if (
+                    not order_status.get("Success")
+                    or not isinstance(order_status["Success"], list)
+                    or len(order_status["Success"]) == 0
+                ):
+                    logging.warning(
+                        f"Unexpected order status response format: {order_status}"
+                    )
+                    time.sleep(wait_interval)
+                    waited_time += wait_interval
+                    continue
+
+                # Get the first order in the Success list
+                order_info = order_status["Success"][0]
+                status = order_info.get("status", "Unknown")
+
+                # Calculate filled quantity and get entry price
+                try:
+                    quantity = int(order_info.get("quantity", 0))
+                    pending_qty = int(order_info.get("pending_quantity", 0))
+                    filled_qty = quantity - pending_qty
+                    entry_price = float(order_info.get("average_price", current_price))
+                except (ValueError, TypeError):
+                    filled_qty = 0
+                    entry_price = current_price
+
                 logging.info(
-                    f"Order status for {stock_code} (ID: {order_id}): {status_code}"
+                    f"Order status for {stock_code} (ID: {order_id}): {status}, "
+                    f"Filled: {filled_qty}/{order_info.get('quantity')}, "
+                    f"Price: {entry_price:.2f}"
                 )
 
                 # Track status history
-                order_status_history.append((datetime.datetime.now(), status_code))
+                order_status_history.append((datetime.datetime.now(), status))
 
-                # Check if order is completed based on status code
-                # Breeze API returns status codes like "500" for pending orders
-                if status_code == "500":
-                    # Check if order is actually filled
-                    filled_quantity = order_status.get("filled_quantity", 0)
-                    if filled_quantity > 0:
-                        executed_price = float(order_status.get("average_price", 0))
-                        if executed_price > 0:
-                            logging.warning(
-                                f"Confirmed Buy order execution for {stock_code} at {executed_price}"
-                            )
+                # Handle different order statuses
+                if status == "Executed":
+                    try:
+                        executed_price = float(
+                            order_info.get("average_price", current_price)
+                        )
+                        logging.info(f"Order executed at price: {executed_price}")
+
+                        # Update position with executed price
+                        if stock_code in positions:
                             positions[stock_code]["entry_price"] = executed_price
                             positions[stock_code]["position_value"] = (
                                 executed_price * quantity
                             )
                             save_positions()
-                            break
-                elif status_code == "200":  # Completed
-                    executed_price = float(order_status.get("average_price", 0))
-                    if executed_price > 0:
-                        logging.warning(
-                            f"Buy order executed for {stock_code} at {executed_price}"
-                        )
-                        break
-                else:
-                    # Handle other status codes
-                    logging.warning(f"Unknown status code: {status_code}")
-                    return False
 
+                    except (ValueError, TypeError):
+                        logging.error(f"Invalid price in order response: {order_info}")
+                        return False, 0
+
+                elif status in ["Cancelled", "Rejected", "Expired"]:
+                    logging.warning(f"Order {status} for {stock_code}")
+                    if stock_code in positions:
+                        del positions[stock_code]
+                        save_positions()
+                    return False, 0
+
+                # If order is still pending, wait and check again
                 time.sleep(wait_interval)
                 waited_time += wait_interval
 
@@ -1406,41 +1421,63 @@ def exit_position(stock_code, exit_reason="Manual"):
         while waited_time < max_wait_time:
             try:
                 # Get order status
-                order_status = breeze.get_order_detail(order_id=order_id)
+                order_status = breeze.get_order_detail(
+                    order_id=order_id, exchange_code=exchange_code or "NSE"
+                )
+                logging.info(f"Order details: {order_status}")
 
-                # Handle Breeze API's status codes
-                status_code = str(order_status) if order_status else "Unknown"
+                # Check if we got a valid response with Success list
+                if (
+                    not order_status.get("Success")
+                    or not isinstance(order_status["Success"], list)
+                    or len(order_status["Success"]) == 0
+                ):
+                    logging.warning(
+                        f"Unexpected order status response format: {order_status}"
+                    )
+                    time.sleep(wait_interval)
+                    waited_time += wait_interval
+                    continue
+
+                # Get the first order in the Success list
+                order_info = order_status["Success"][0]
+                status = order_info.get("status", "Unknown")
+
+                # Calculate filled quantity
+                try:
+                    filled_qty = int(order_info.get("quantity", 0)) - int(
+                        order_info.get("pending_quantity", 0)
+                    )
+                except (ValueError, TypeError):
+                    filled_qty = 0
+
                 logging.info(
-                    f"Order status for {stock_code} (ID: {order_id}): {status_code}"
+                    f"Sell order status for {stock_code} (ID: {order_id}): {status}, "
+                    f"Filled: {filled_qty}/{order_info.get('quantity')}"
                 )
 
                 # Track status history
-                order_status_history.append((datetime.datetime.now(), status_code))
+                order_status_history.append((datetime.datetime.now(), status))
 
-                # Check if order is completed based on status code
-                # Breeze API returns status codes like "500" for pending orders
-                if status_code == "500":
-                    # Check if order is actually filled
-                    filled_quantity = order_status.get("filled_quantity", 0)
-                    if filled_quantity > 0:
-                        executed_price = float(order_status.get("average_price", 0))
-                        if executed_price > 0:
-                            logging.warning(
-                                f"Sell order executed for {stock_code} at {executed_price}"
-                            )
-                            break
-                elif status_code == "200":  # Completed
-                    executed_price = float(order_status.get("average_price", 0))
-                    if executed_price > 0:
+                # Handle different order statuses
+                if status == "Executed":
+                    try:
+                        executed_price = float(
+                            order_info.get("average_price", current_price)
+                        )
                         logging.warning(
                             f"Sell order executed for {stock_code} at {executed_price}"
                         )
                         break
-                else:
-                    # Handle other status codes
-                    logging.warning(f"Unknown status code: {status_code}")
+                    except (ValueError, TypeError):
+                        logging.error(f"Invalid price in order response: {order_info}")
+                        return False
+
+                elif status in ["Cancelled", "Rejected", "Expired"]:
+                    logging.warning(f"Sell order {status} for {stock_code}")
                     return False
 
+                # If order is still pending, wait and check again
                 time.sleep(wait_interval)
                 waited_time += wait_interval
 
@@ -1452,21 +1489,27 @@ def exit_position(stock_code, exit_reason="Manual"):
         if executed_price == 0:
             # Log the status history for debugging
             logging.error(
-                f"Order for {stock_code} did not execute within expected time"
+                f"Sell order for {stock_code} did not execute within expected time"
             )
             logging.error("Order status history:")
             for timestamp, status in order_status_history:
                 logging.error(f"{timestamp}: {status}")
 
             # Try to cancel the order if it's still pending
-            if order_status and status_code == "500":
-                try:
-                    cancel_response = breeze.cancel_order(order_id=order_id)
-                    logging.info(
-                        f"Attempted to cancel pending order: {cancel_response}"
-                    )
-                except Exception as e:
-                    logging.error(f"Error cancelling order: {e}")
+            if (
+                order_status
+                and order_status.get("Success")
+                and len(order_status["Success"]) > 0
+            ):
+                order_info = order_status["Success"][0]
+                if order_info.get("status") == "Pending":
+                    try:
+                        cancel_response = breeze.cancel_order(order_id=order_id)
+                        logging.info(
+                            f"Attempted to cancel pending order: {cancel_response}"
+                        )
+                    except Exception as e:
+                        logging.error(f"Error cancelling order: {e}")
 
             return False
 
@@ -1529,6 +1572,7 @@ def exit_position(stock_code, exit_reason="Manual"):
 
 def save_positions():
     """Save current positions to file"""
+    global positions
     try:
         positions_dir = "positions"
         today_str = datetime.datetime.now().strftime("%Y%m%d")
@@ -1548,6 +1592,7 @@ def save_positions():
 
 def load_positions():
     """Load positions from file"""
+    global positions  # Add this line to modify the global variable
     try:
         positions_dir = "positions"
         today_str = datetime.datetime.now().strftime("%Y%m%d")
@@ -1555,15 +1600,21 @@ def load_positions():
 
         if os.path.exists(filename):
             with open(filename, "r") as f:
-                positions = json.load(f)
+                positions.clear()  # Clear existing positions
+                positions.update(json.load(f))  # Update with loaded positions
             logging.info(f"Loaded {len(positions)} positions from file")
             logging.info(f"Positions loaded: {positions}")
+        else:
+            positions.clear()  # Clear positions if no file exists for today
+            logging.info("No positions file found for today, starting fresh")
     except Exception as e:
         logging.error(f"Error loading positions: {e}")
+        positions.clear()  # Clear positions on error to avoid inconsistent state
 
 
 def save_trades():
     """Save today's trades to file"""
+    global today_trades
     try:
         trades_dir = "trades"
         if not os.path.exists(trades_dir):
@@ -1583,6 +1634,7 @@ def save_trades():
 
 def load_today_trades():
     """Load today's trades from file if exists"""
+    global today_trades  # Add this line to modify the global variable
     try:
         trades_dir = "trades"
         today_str = datetime.datetime.now().strftime("%Y%m%d")
@@ -1590,13 +1642,16 @@ def load_today_trades():
 
         if os.path.exists(filename):
             with open(filename, "r") as f:
-                today_trades = json.load(f)
+                today_trades.clear()  # Clear existing trades
+                today_trades.extend(json.load(f))  # Update with loaded trades
 
             logging.info(f"Loaded {len(today_trades)} trades for today")
-
+        else:
+            today_trades.clear()  # Clear trades if no file exists for today
+            logging.info("No trades file found for today, starting fresh")
     except Exception as e:
         logging.error(f"Error loading today's trades: {e}")
-        today_trades = []
+        today_trades.clear()  # Clear trades on error to avoid inconsistent state
 
 
 def check_market_status():
@@ -1938,16 +1993,62 @@ def manage_positions(market_condition):
     Returns:
         int: Number of positions exited
     """
-    positions_to_check = list(positions.keys())
+    positions_to_check = list(positions.items())  # Get a snapshot of current positions
     exited_count = 0
+    MIN_HOLDING_DAYS = 1  # Minimum days to hold a position
+    EXTREME_BEARISH_EXIT_THRESHOLD = (
+        -2.0
+    )  # Max loss % to accept in extreme bearish market
 
-    for stock_code in positions_to_check:
+    for stock_code, position in positions_to_check:
+        logging.debug(f"Processing position for {stock_code}")
+
+        # Skip if position no longer exists or is already being processed
+        if stock_code not in positions or position.get("exiting", False):
+            continue
+
         try:
-            position = positions[stock_code]
+            # Mark position as being processed
+            positions[stock_code]["exiting"] = True
             exchange_code = position["exchange"]
             entry_price = position["entry_price"]
+            entry_time = position.get("entry_time")
 
-            # Get historical data
+            # Skip if position is too new
+            if entry_time:
+                entry_date = datetime.datetime.fromisoformat(entry_time)
+                days_held = (datetime.datetime.now() - entry_date).days
+                if days_held < MIN_HOLDING_DAYS:
+                    logging.debug(
+                        f"Skipping {stock_code}: Only held for {days_held} days (min: {MIN_HOLDING_DAYS} days)"
+                    )
+                    continue
+
+            # Get current price first to minimize time between checks
+            current_price = get_current_price(stock_code, exchange_code)
+            if current_price is None:
+                logging.debug(f"Skipping {stock_code}: Failed to get current price")
+                continue
+
+            logging.debug(f"{stock_code} current price: {current_price:.2f}")
+
+            # Check trailing stop first (fastest check)
+            if "stop_loss" in position and position["stop_loss"] > 0:
+                if current_price < position["stop_loss"]:
+                    logging.info(
+                        f"{stock_code}: Stop loss triggered (Price: {current_price:.2f} < Stop: {position['stop_loss']:.2f})"
+                    )
+                    if exit_position(stock_code, exit_reason="Trailing stop hit"):
+                        exited_count += 1
+                        continue
+                else:
+                    logging.debug(
+                        f"{stock_code}: No stop loss hit (Price: {current_price:.2f} >= Stop: {position['stop_loss']:.2f})"
+                    )
+            else:
+                logging.debug(f"{stock_code}: No valid stop loss set")
+
+            # Get historical data only if needed
             hist_data = get_historical_data(stock_code, exchange_code)
             if hist_data is None:
                 continue
@@ -1957,48 +2058,50 @@ def manage_positions(market_condition):
             if with_indicators is None:
                 continue
 
-            current_price = get_current_price(stock_code, exchange_code)
-            if current_price is None:
-                continue
-
-            # CHECK TRAILING STOP - ADD THIS BLOCK HERE
-            if (
-                "stop_loss" in position
-                and position["stop_loss"] > 0
-                and current_price < position["stop_loss"]
-            ):
-                if exit_position(stock_code, exit_reason="Trailing stop hit"):
-                    exited_count += 1
-                    continue  # Skip to next position since we've already exited this one
-
             # Check for sell signal using mid-term criteria
             sell_signal, reason = check_sell_signal(with_indicators, entry_price)
+            logging.warning(
+                f"{stock_code}: Sell signal check - Signal: {sell_signal}, Reason: {reason}"
+            )
 
             # Exit based on signal
             if sell_signal:
+                logging.warning(f"{stock_code}: Exiting position - {reason}")
                 if exit_position(stock_code, exit_reason=reason):
                     exited_count += 1
+                    continue
+                else:
+                    logging.warning(
+                        f"{stock_code}: Failed to exit position despite sell signal"
+                    )
 
             # Additional exit only if market turned extremely bearish
-            elif (
+            if (
                 market_condition["trend"] == "bearish"
                 and market_condition["strength"] == "strong"
                 and market_condition.get("close_vs_sma200", 0) < -5
-            ):  # Only if significantly below 200 SMA
-
-                # Get current price for P&L calculation
-                if current_price:
-                    profit_percent = ((current_price / entry_price) - 1) * 100
-
-                    # Only exit if in profit or small loss
-                    if profit_percent > -2.0:
-                        if exit_position(
-                            stock_code, exit_reason="Extreme bearish market condition"
-                        ):
-                            exited_count += 1
+            ):
+                profit_percent = ((current_price / entry_price) - 1) * 100
+                if profit_percent > EXTREME_BEARISH_EXIT_THRESHOLD:
+                    reason = (
+                        f"Extreme bearish market condition (P&L: {profit_percent:.2f}%)"
+                    )
+                    if exit_position(stock_code, exit_reason=reason):
+                        exited_count += 1
+                        logging.warning(
+                            f"{stock_code}: Exited due to extreme bearish market"
+                        )
+                    else:
+                        logging.warning(
+                            f"{stock_code}: Failed to exit position in extreme bearish market"
+                        )
 
         except Exception as e:
             logging.error(f"Error managing position for {stock_code}: {e}")
+            logging.error(traceback.format_exc())
+        finally:
+            if stock_code in positions:
+                positions[stock_code].pop("exiting", None)
 
     return exited_count
 
@@ -2006,6 +2109,8 @@ def manage_positions(market_condition):
 def generate_daily_report():
     """Generate and send daily trading report"""
     # Calculate daily P&L
+    global positions, today_trades
+
     daily_pnl = 0
     for trade in today_trades:
         daily_pnl += trade.get("profit_loss", 0)
@@ -2138,11 +2243,16 @@ def generate_daily_report():
 def run_strategy():
     """
     Run the trading strategy with mid-term focus
-
     Returns:
-        bool: True if strategy execution completed successfully, False otherwise
+    True if strategy execution completed successfully, False otherwise
     """
-    logging.info("Running mid-term trading strategy")
+    global today_trades, positions
+    logging.info("STARTED RUNNINV MID-TERM TRADING STRATEGY")
+    load_positions()
+    logging.warning(f"Current positions: {positions}")
+    load_today_trades()
+    logging.warning(f"Current trades: {today_trades}")
+
     # Check if market is open
     if not check_market_status():
         logging.info("Market is closed. Skipping strategy execution.")
@@ -2201,10 +2311,10 @@ def run_strategy():
 
         # Manage existing positions with mid-term criteria
         positions_exited = manage_positions(market_condition)
-        logging.info(f"Exited {positions_exited} positions")
+        logging.warning(f"Exited {positions_exited} positions")
 
         updated_stops = update_trailing_stops()
-        logging.info(f"Updated trailing stops for {updated_stops} positions")
+        logging.warning(f"Updated trailing stops for {updated_stops} positions")
 
         # Only look for new opportunities if we have fewer than MAX_POSITIONS
         # AND the market is above 200-day SMA (critical for mid-term trading)
@@ -2262,6 +2372,7 @@ def run_strategy():
         # Save positions and trades
         save_positions()
         save_trades()
+        logging.warning("Run Strategy completed: Positions and trades saved")
 
         return True  # Strategy execution successful
 

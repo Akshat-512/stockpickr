@@ -2,4 +2,8 @@
 *positions
 *logs
 *breeze_venv
-*__pycache__
+*__pycache__/
+config.ini
+reports
+trader.log
+continuous_trading.log
