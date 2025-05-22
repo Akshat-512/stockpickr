@@ -99,8 +99,6 @@ def initialize_api():
         logging.info("Using provided session token")
         breeze.generate_session(api_secret=API_SECRET, session_token=SESSION_TOKEN)
 
-        return True
-
         # Check connection by making an API call
         try:
             user_profile = breeze.get_customer_details(api_session=SESSION_TOKEN)
@@ -1591,25 +1589,64 @@ def save_positions():
 
 
 def load_positions():
-    """Load positions from file"""
-    global positions  # Add this line to modify the global variable
+    """
+    Load positions from file. If today's positions file doesn't exist,
+    loads positions from the most recent previous trading day's file.
+    """
+    global positions
+    positions_dir = "positions"
+    os.makedirs(positions_dir, exist_ok=True)
+
     try:
-        positions_dir = "positions"
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        today = datetime.datetime.now()
+        today_str = today.strftime("%Y%m%d")
         filename = os.path.join(positions_dir, f"positions_{today_str}.json")
 
+        # If today's file exists, load it
         if os.path.exists(filename):
             with open(filename, "r") as f:
-                positions.clear()  # Clear existing positions
-                positions.update(json.load(f))  # Update with loaded positions
-            logging.info(f"Loaded {len(positions)} positions from file")
-            logging.info(f"Positions loaded: {positions}")
+                positions.clear()
+                positions.update(json.load(f))
+            logging.info(f"Loaded {len(positions)} positions from today's file")
+            return
+
+        # If we get here, today's file doesn't exist
+        # Look for the most recent positions file
+        position_files = sorted(
+            [f for f in os.listdir(positions_dir) if f.startswith("positions_")],
+            reverse=True,
+        )
+
+        if position_files:
+            # Get the most recent positions file
+            latest_file = position_files[0]
+            latest_path = os.path.join(positions_dir, latest_file)
+
+            # Load positions from the latest file
+            with open(latest_path, "r") as f:
+                positions.clear()
+                positions.update(json.load(f))
+
+            # Save as today's positions
+            with open(filename, "w") as f:
+                json.dump(positions, f, indent=2)
+
+            logging.info(
+                f"Copied {len(positions)} positions from {latest_file} to today's file"
+            )
         else:
-            positions.clear()  # Clear positions if no file exists for today
-            logging.info("No positions file found for today, starting fresh")
+            # No position files exist at all
+            positions.clear()
+            logging.info("No previous positions found, starting fresh")
+
+    except json.JSONDecodeError as e:
+        logging.error(f"Error parsing positions file: {e}")
+        positions.clear()
     except Exception as e:
         logging.error(f"Error loading positions: {e}")
-        positions.clear()  # Clear positions on error to avoid inconsistent state
+        positions.clear()
+    finally:
+        logging.info(f"Current positions: {positions}")
 
 
 def save_trades():
@@ -1830,7 +1867,7 @@ def filter_fundamentals(stock_codes, exchange_code="NSE"):
                 # Apply fundamental filters
                 # PE < 20, debt-to-equity < 1, positive earnings growth
                 if pe < 20 and debt_eq < 1 and earnings_growth > 0.1:
-                    logging.info(
+                    logging.warning(
                         f"Stock {code} passed fundamental filters: PE={pe:.2f}, D/E={debt_eq:.2f}, EG={earnings_growth:.2f}"
                     )
                     filtered.append(code)
@@ -2110,6 +2147,8 @@ def generate_daily_report():
     """Generate and send daily trading report"""
     # Calculate daily P&L
     global positions, today_trades
+    load_positions()
+    load_today_trades()
 
     daily_pnl = 0
     for trade in today_trades:
@@ -2163,7 +2202,10 @@ def generate_daily_report():
     -----------------
     """
 
+    # Add current positions
     if positions:
+        report += "CURRENT POSITIONS:\n"
+        report += "-----------------\n"
         for stock_code, position in positions.items():
             entry_price = position.get("entry_price", 0)
             quantity = position.get("quantity", 0)
@@ -2179,44 +2221,40 @@ def generate_daily_report():
                 pnl_percent = ((current_price / entry_price) - 1) * 100
 
                 report += f"""
-            {stock_code}:
-            Entry Price: ₹{entry_price:.2f}
-            Current Price: ₹{current_price:.2f}
-            Quantity: {quantity}
-            Stop Loss: ₹{stop_loss:.2f}
-            Unrealized P&L: ₹{pnl:.2f} ({pnl_percent:.2f}%)
-            Held Since: {entry_time}
-            """
+                {stock_code}:
+                Entry Price: ₹{entry_price:.2f}
+                Current Price: ₹{current_price:.2f}
+                Quantity: {quantity}
+                Stop Loss: ₹{stop_loss:.2f}
+                Unrealized P&L: ₹{pnl:.2f} ({pnl_percent:.2f}%)
+                Held Since: {entry_time}\n
+                """
             else:
                 report += f"""
-            {stock_code}:
-            Entry Price: ₹{entry_price:.2f}
-            Current Price: Unable to fetch
-            Quantity: {quantity}
-            Stop Loss: ₹{stop_loss:.2f}
-            Held Since: {entry_time}
-            """
+                {stock_code}:
+                Entry Price: ₹{entry_price:.2f}
+                Current Price: Unable to fetch
+                Quantity: {quantity}
+                Stop Loss: ₹{stop_loss:.2f}
+                Held Since: {entry_time}\n
+                """
 
-            # Add completed trades
-            report += """
-            COMPLETED TRADES TODAY:
-            -----------------------
-            """
+    # Add completed trades section
+    report += "\nCOMPLETED TRADES TODAY:\n"
+    report += "----------------------\n"
 
-            if today_trades:
-                for i, trade in enumerate(today_trades, 1):
-                    report += f"""
-                        Trade #{i}:
-                        Stock: {trade.get('stock_code', 'Unknown')}
-                        Entry: ₹{trade.get('entry_price', 0):.2f}
-                        Exit: ₹{trade.get('exit_price', 0):.2f}
-                        Quantity: {trade.get('quantity', 0)}
-                        P&L: ₹{trade.get('profit_loss', 0):.2f} ({trade.get('profit_loss_percent', 0):.2f}%)
-                        Exit Type: {trade.get('exit_type', 'Unknown')}
-                        Exit Time: {trade.get('exit_time', 'Unknown')}
-                        """
-            else:
-                report += "No trades completed today.\n"
+    if today_trades:
+        for i, trade in enumerate(today_trades, 1):
+            report += f"""
+            Trade #{i}:
+            Stock: {trade.get('stock_code', 'Unknown')}
+            Entry: ₹{trade.get('entry_price', 0):.2f}
+            Exit: ₹{trade.get('exit_price', 0):.2f}
+            Quantity: {trade.get('quantity', 0)}
+            P&L: ₹{trade.get('profit_loss', 0):.2f} ({trade.get('profit_loss_percent', 0):.2f}%)
+            Exit Type: {trade.get('exit_type', 'Unknown')}
+            Exit Time: {trade.get('exit_time', 'Unknown')}\n
+            """
     else:
         report += "No trades completed today.\n"
 

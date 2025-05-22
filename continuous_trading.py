@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Continuous Trader - Runs the trading strategy in a loop during market hours
-Specifically optimized for macOS
+Continuous Trading System
+
+Runs automated trading strategies during market hours with session management,
+error handling, and reporting capabilities.
 """
 
 import sys
@@ -11,226 +13,330 @@ import time
 import datetime
 import logging
 import signal
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
 
-# Add the trader directory to the path if needed
-# sys.path.append('/path/to/trader')
-
-# Import your existing trader module
 import trader
 
-# Flags for testing strategy execution off-hours
-RUN_STRATEGY_OFF_HOURS_FOR_TESTING = False  # Set to False for normal operation
-TEST_MODE_STRATEGY_INTERVAL_SECONDS = 300  # Run strategy every 5 minutes in test mode
-TEST_MODE_LOOP_SLEEP_SECONDS = 30  # Main loop sleeps for 30 seconds in test mode
-NORMAL_MODE_STRATEGY_INTERVAL_SECONDS = (
-    1800  # Run strategy every 30 minutes in normal mode
-)
-NORMAL_MODE_LOOP_SLEEP_SECONDS = 60  # Main loop sleeps for 60 seconds in normal mode
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("continuous_trader.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+# Configuration
+class Config:
+    """Global configuration settings."""
+
+    RUN_STRATEGY_OFF_HOURS = False  # Set to True for testing outside market hours
+    TEST_MODE_STRATEGY_INTERVAL = 300  # 5 minutes
+    TEST_MODE_LOOP_SLEEP = 30  # 30 seconds
+    NORMAL_MODE_STRATEGY_INTERVAL = 1800  # 30 minutes
+    NORMAL_MODE_LOOP_SLEEP = 60  # 60 seconds
+
+    # Market hours (IST)
+    MARKET_OPEN = datetime.time(9, 15)  # 9:15 AM
+    MARKET_CLOSE = datetime.time(15, 30)  # 3:30 PM
+    PRE_MARKET_OPEN = datetime.time(9, 0)  # 9:00 AM
+    POST_MARKET_CLOSE = datetime.time(15, 45)  # 3:45 PM
+
+    # Report generation
+    REPORT_GEN_HOURS = {0, 12}  # Generate reports at midnight and noon
+    REPORT_GEN_WINDOW = 2  # Minutes window for report generation
+    REPORTS_DIR = "reports"
 
 
-def refresh_session():
-    """Refresh the API session if needed"""
+@dataclass
+class TradingSession:
+    """Manages the trading session state."""
+
+    day_started: bool = False
+    day_ended: bool = False
+    last_run_time: Optional[datetime.datetime] = None
+    positions: Dict[str, Any] = field(default_factory=dict)
+    today_trades: list = field(default_factory=list)
+
+    def reset_for_new_day(self):
+        """Reset session state for a new trading day."""
+        self.day_started = False
+        self.day_ended = False
+        self.today_trades = []
+        self.positions = {}
+        logging.info("Trading session reset for new day")
+
+
+def setup_logging() -> None:
+    """Configure logging to both file and console."""
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "continuous_trader.log")
+
+    # Clear existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Create formatter
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # File handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+
+    # Add handlers
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    logging.info("=" * 60)
+    logging.info("STARTING CONTINUOUS TRADING SYSTEM")
+    logging.info(f"Log file: {os.path.abspath(log_file)}")
+    logging.info(f"Python: {sys.version.split()[0]} on {sys.platform}")
+    logging.info("=" * 60)
+
+
+# Initialize logging
+setup_logging()
+
+
+def refresh_session() -> bool:
+    """Refresh the API session if needed."""
     try:
-        # Test the current session by making a simple API call
         test_result = trader.breeze.get_customer_details(
             api_session=trader.SESSION_TOKEN
         )
+        if test_result and "Success" in test_result:
+            return True
 
-        if not test_result or "Success" not in test_result:
-            logging.warning("Session appears to be invalid, attempting to refresh")
+        logging.warning("Session invalid, attempting to refresh...")
+        if trader.initialize_api():
+            logging.info("Session refreshed successfully")
+            return True
 
-            # Re-initialize API
-            if trader.initialize_api():
-                logging.info("Session refreshed successfully")
-                return True
-            else:
-                logging.error("Failed to refresh session")
-                return False
-
-        return True  # Session is valid
+        logging.error("Failed to refresh session")
+        return False
 
     except Exception as e:
-        logging.error(f"Error checking/refreshing session: {e}")
+        logging.error(f"Error refreshing session: {e}", exc_info=True)
         return False
 
 
-def is_market_day():
-    """Check if today is a trading day (Monday to Friday)"""
-    current_day = datetime.datetime.now().strftime("%A")
-    trading_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-    return current_day in trading_days
+def is_market_day() -> bool:
+    """Check if today is a trading day (Monday to Friday)."""
+    return datetime.datetime.now().weekday() < 5  # 0=Monday, 6=Sunday
 
 
-def is_during_market_hours():
-    """Check if current time is during market hours (9:15 AM to 3:30 PM)"""
+def is_during_market_hours() -> bool:
+    """Check if current time is during market hours."""
     now = datetime.datetime.now().time()
-    market_open = datetime.time(9, 15)
-    market_close = datetime.time(15, 30)
-    return market_open <= now <= market_close
+    return Config.MARKET_OPEN <= now <= Config.MARKET_CLOSE
 
 
-def is_pre_market():
-    """Check if current time is just before market open (9:00 AM to 9:15 AM)"""
+def is_pre_market() -> bool:
+    """Check if current time is during pre-market hours."""
     now = datetime.datetime.now().time()
-    pre_open_start = datetime.time(9, 0)
-    market_open = datetime.time(9, 15)
-    return pre_open_start <= now < market_open
+    return Config.PRE_MARKET_OPEN <= now < Config.MARKET_OPEN
 
 
-def is_post_market():
-    """Check if current time is just after market close (3:30 PM to 3:45 PM)"""
+def is_post_market() -> bool:
+    """Check if current time is during post-market hours."""
     now = datetime.datetime.now().time()
-    market_close = datetime.time(15, 30)
-    post_close_end = datetime.time(15, 45)
-    return market_close < now <= post_close_end
+    return Config.MARKET_CLOSE < now <= Config.POST_MARKET_CLOSE
 
 
-def run_continuously():
-    """Run the trading strategy continuously"""
-    print("=== STARTING CONTINUOUS TRADER ===")
-    logging.info("Starting continuous trader")
+def check_and_generate_report() -> bool:
+    """
+    Check if today's report exists and generate it if missing.
 
-    # Initialize API connection only once
+    Returns:
+        bool: True if report was generated or already exists, False on error
+    """
+    try:
+        os.makedirs(Config.REPORTS_DIR, exist_ok=True)
+        today = datetime.date.today()
+        report_file = os.path.join(
+            Config.REPORTS_DIR, f"report_{today.strftime('%Y%m%d')}.txt"
+        )
+
+        if not os.path.exists(report_file):
+            logging.info("Today's report not found. Generating daily report...")
+            trader.generate_daily_report()
+
+            # Verify report was created
+            if os.path.exists(report_file):
+                logging.info(f"Successfully generated report: {report_file}")
+                return True
+            else:
+                logging.error(f"Failed to generate report: {report_file}")
+                return False
+
+        logging.debug("Today's report already exists")
+        return True
+
+    except Exception as e:
+        logging.error(f"Error in check_and_generate_report: {e}", exc_info=True)
+        return False
+
+
+def generate_daily_report() -> None:
+    """Generate and save daily trading report if it doesn't exist."""
+    if not check_and_generate_report():
+        logging.warning("Failed to ensure daily report exists")
+
+
+def run_trading_cycle(session: TradingSession) -> None:
+    """Execute one cycle of the trading strategy."""
+    now = datetime.datetime.now()
+
+    # Check for new day
+    if session.last_run_time and session.last_run_time.date() != now.date():
+        session.reset_for_new_day()
+        generate_daily_report()
+
+    # Log market status
+    logging.info(
+        f"Market - Day: {is_market_day()}, "
+        f"Hours: {is_during_market_hours()}, "
+        f"Pre: {is_pre_market()}, "
+        f"Post: {is_post_market()}"
+    )
+
+    # Generate reports at configured times
+    if now.hour in Config.REPORT_GEN_HOURS and now.minute < Config.REPORT_GEN_WINDOW:
+        generate_daily_report()
+
+    # Run strategy based on market conditions
+    if Config.RUN_STRATEGY_OFF_HOURS:
+        run_test_mode(session, now)
+    else:
+        run_normal_mode(session, now)
+
+
+def run_test_mode(session: TradingSession, now: datetime.datetime) -> None:
+    """Run trading strategy in test mode."""
+    logging.info("Test Mode: Active")
+
+    if not refresh_session():
+        logging.error("Test Mode: Session refresh failed")
+        time.sleep(300)
+        return
+
+    if (
+        session.last_run_time is None
+        or (now - session.last_run_time).seconds >= Config.TEST_MODE_STRATEGY_INTERVAL
+    ):
+        logging.info(
+            f"Test Mode: Running strategy (Interval: {Config.TEST_MODE_STRATEGY_INTERVAL}s)"
+        )
+        trader.run_strategy()
+        session.last_run_time = now
+
+
+def run_normal_mode(session: TradingSession, now: datetime.datetime) -> None:
+    """Run trading strategy in normal market mode."""
+    if not is_market_day():
+        return
+
+    if not refresh_session():
+        logging.error("Normal Mode: Session refresh failed")
+        time.sleep(300)
+        return
+
+    # Pre-market
+    if is_pre_market() and not session.day_started:
+        logging.info("Normal Mode: Pre-market preparation")
+        session.day_started = True
+        trader.load_positions()
+        trader.load_today_trades()
+
+    # Market hours
+    elif is_during_market_hours():
+        if (
+            session.last_run_time is None
+            or (now - session.last_run_time).seconds
+            >= Config.NORMAL_MODE_STRATEGY_INTERVAL
+        ):
+            logging.info(
+                f"Normal Mode: Running strategy (Interval: {Config.NORMAL_MODE_STRATEGY_INTERVAL}s)"
+            )
+            trader.run_strategy()
+            session.last_run_time = now
+
+    # Post-market
+    elif is_post_market() and not session.day_ended:
+        logging.info("Normal Mode: End-of-day procedures")
+        generate_daily_report()
+        trader.save_trades()
+        session.day_ended = True
+    else:
+        generate_daily_report()
+        logging.info("Normal Mode: Market closed")
+
+
+def get_sleep_duration() -> int:
+    """Determine how long to sleep based on current mode and market status."""
+    if Config.RUN_STRATEGY_OFF_HOURS:
+        return Config.TEST_MODE_LOOP_SLEEP
+
+    if not is_market_day() or not any(
+        [is_during_market_hours(), is_pre_market(), is_post_market()]
+    ):
+        logging.info("Market closed. Next check in 1 hour.")
+        return 3600  # 1 hour
+
+    return Config.NORMAL_MODE_LOOP_SLEEP
+
+
+def run_continuously() -> None:
+    """Run the trading strategy continuously."""
+    logging.info("Starting continuous trading system")
+
     if not trader.initialize_api():
         logging.error("Failed to initialize API. Exiting.")
         return
 
-    # Load any existing positions
-    trader.load_positions()
-    trader.load_today_trades()
-
-    day_started = False
-    day_ended = False
-    last_run_time = None
+    session = TradingSession()
 
     try:
         while True:
-            now = datetime.datetime.now()
-            current_day = now.strftime("%Y-%m-%d")
-            # print(f"\n=== CONTINUOUS TRADER RUN AT {now.strftime('%H:%M:%S')} ===")
-            # print(f"Current day: {current_day}")
-            # print(f"Market day: {is_market_day()}")
-            # print(f"Market hours: {is_during_market_hours()}")
-            # print(f"Pre-market: {is_pre_market()}")
-            # print(f"Post-market: {is_post_market()}")
-            # print(f"Last run time: {last_run_time}")
-            # print(
-            #     f"Time since last run: {(now - last_run_time).seconds if last_run_time else 'N/A'}"
-            # )
-            # print(f"Strategy interval: {NORMAL_MODE_STRATEGY_INTERVAL_SECONDS} seconds")
-
-            # Check if it's a new day (applies to both modes)
-            if last_run_time and last_run_time.strftime("%Y-%m-%d") != current_day:
-                day_started = False  # Reset for normal mode logic
-                day_ended = False  # Reset for normal mode logic
-                trader.today_trades = []  # Reset today's trades
-                logging.info(f"New day ({current_day}). Resetting daily states.")
-
-            if RUN_STRATEGY_OFF_HOURS_FOR_TESTING:
-                logging.info("CONTINUOUS TRADER (Test Mode): Active.")
-                if not refresh_session():  # Ensure session is valid
-                    logging.error(
-                        "CONTINUOUS TRADER (Test Mode): Unable to maintain valid session. Waiting."
-                    )
-                    time.sleep(300)  # Wait 5 minutes before trying again
-                    continue
-
-                # Run the strategy periodically in test mode
-                if (
-                    last_run_time is None
-                    or (now - last_run_time).seconds
-                    >= TEST_MODE_STRATEGY_INTERVAL_SECONDS
-                ):
-                    logging.info(
-                        f"CONTINUOUS TRADER (Test Mode): Running trader.run_strategy() (Interval: {TEST_MODE_STRATEGY_INTERVAL_SECONDS}s)"
-                    )
-                    trader.run_strategy()
-                    last_run_time = now
-            else:  # Normal Operation Mode (RUN_STRATEGY_OFF_HOURS_FOR_TESTING is False)
-                logging.info("CONTINUOUS TRADER (Normal Mode): Active.")
-                if is_market_day():
-                    if not refresh_session():  # Ensure session is valid
-                        logging.error(
-                            "CONTINUOUS TRADER (Normal Mode): Unable to maintain valid session. Waiting."
-                        )
-                        time.sleep(300)  # Wait 5 minutes before trying again
-                        continue
-
-                    # Pre-market preparation
-                    if is_pre_market() and not day_started:
-                        logging.info(
-                            "CONTINUOUS TRADER (Normal Mode): Pre-market preparation"
-                        )
-                        day_started = True
-                        trader.load_positions()
-                        trader.load_today_trades()
-                        # Potentially run strategy once: trader.run_strategy()
-                        # last_run_time = now
-
-                    # Regular market hours operation
-                    elif is_during_market_hours():
-                        if (
-                            last_run_time is None
-                            or (now - last_run_time).seconds
-                            >= NORMAL_MODE_STRATEGY_INTERVAL_SECONDS
-                        ):
-                            logging.info(
-                                f"CONTINUOUS TRADER (Normal Mode): Running trader.run_strategy() (Interval: {NORMAL_MODE_STRATEGY_INTERVAL_SECONDS}s)"
-                            )
-                            trader.run_strategy()
-                            last_run_time = now
-
-                    # Post-market operations
-                    elif is_post_market() and not day_ended:
-                        logging.info(
-                            "CONTINUOUS TRADER (Normal Mode): Running end-of-day procedures"
-                        )
-                        trader.generate_daily_report()
-                        trader.save_trades()
-                        day_ended = True
-
-            # Determine sleep duration based on mode
-            current_loop_sleep = (
-                TEST_MODE_LOOP_SLEEP_SECONDS
-                if RUN_STRATEGY_OFF_HOURS_FOR_TESTING
-                else NORMAL_MODE_LOOP_SLEEP_SECONDS
-            )
-            logging.info(
-                f"CONTINUOUS TRADER: Main loop sleeping for {current_loop_sleep} seconds."
-            )
-            time.sleep(current_loop_sleep)
+            run_trading_cycle(session)
+            sleep_duration = get_sleep_duration()
+            logging.info(f"Sleeping for {sleep_duration} seconds...")
+            time.sleep(sleep_duration)
 
     except KeyboardInterrupt:
-        logging.info("Continuous trader interrupted by user")
+        logging.info("Trading system stopped by user")
     except Exception as e:
-        logging.error(f"Unhandled error in continuous trader: {e}")
-        # Send error notification
+        logging.error(f"Fatal error in trading system: {e}", exc_info=True)
         trader.send_email(
-            "Trading Strategy Error", f"Trading strategy encountered an error: {str(e)}"
+            "Trading System Error",
+            f"A fatal error occurred: {str(e)}\n\nCheck logs for details.",
         )
     finally:
-        logging.info("Continuous trader stopped")
+        logging.info("Trading system shutdown complete")
 
 
-# Graceful shutdown handler
-def signal_handler(sig, frame):
-    logging.info("Received shutdown signal, exiting gracefully...")
+def signal_handler(sig: int, frame) -> None:
+    """Handle shutdown signals gracefully."""
+    logging.info("Shutdown signal received. Exiting...")
     sys.exit(0)
 
 
 if __name__ == "__main__":
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    try:
+        # Register signal handlers
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
-    run_continuously()
+        # Log system info
+        logging.info(f"Working directory: {os.getcwd()}")
+        logging.info(f"Python version: {sys.version}")
+        logging.info(f"Mode: {'TEST' if Config.RUN_STRATEGY_OFF_HOURS else 'NORMAL'}")
+
+        # Start trading
+        run_continuously()
+
+    except Exception as e:
+        logging.critical(f"Critical error: {e}", exc_info=True)
+        sys.exit(1)
