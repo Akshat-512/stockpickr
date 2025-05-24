@@ -23,7 +23,7 @@ from stock_utils import stock_mapper
 from typing import Any, Dict, Optional, Union
 
 
-tech = NSE()
+# tech = NSE() // Use when you want fundamental data
 # Configure logging
 logging.basicConfig(
     level=logging.WARNING,  # Changed from INFO to DEBUG
@@ -68,23 +68,14 @@ MAX_PRICE = config.getfloat(
 MIN_VOLUME = config.getint("Screening", "min_volume", fallback=100000)
 INDEX_FOR_STOCKS = config.get("Screening", "index_name", fallback="NIFTY 50")
 
+
+MAX_WAIT_TIME_ORDER = 60
 INDEX_DIR = "index_csv"
 
 # Global variables for tracking
 breeze = None  # API connection
 positions = {}  # Current positions
 today_trades = []  # Trades executed today
-
-
-ist = pytz.timezone("Asia/Kolkata")
-utc = pytz.timezone("UTC")
-now_ist = datetime.datetime.now(ist)
-to_date_ist = now_ist
-from_date_ist = to_date_ist - datetime.timedelta(days=30)
-from_date_utc = from_date_ist.astimezone(utc)
-to_date_utc = to_date_ist.astimezone(utc)
-from_date_str = from_date_utc.isoformat()
-to_date_str = to_date_utc.isoformat()
 
 
 def initialize_api():
@@ -165,11 +156,10 @@ def send_email(subject, message_body):
         return False
 
 
-def get_historical_data_index(stock_code, exchange_code, interval="1day", days=200):
+def get_historical_data_index(stock_code, interval="1day", days=200):
     """Get historical data for an index using Yahoo Finance.
     Args:
         stock_code (str): Stock or index symbol (e.g., "NIFTY").
-        exchange_code (str): Exchange code (e.g., "NSE").
         interval (str): Time interval (e.g., "1day", "1hour").
         days (int): Number of days of historical data to fetch.
 
@@ -287,7 +277,6 @@ def get_historical_data(stock_code, exchange_code, interval="1day", days=300):
         # Convert to Breeze-compatible symbol for non-index symbols
         if not stock_code.startswith(("NIFTY", "SENSEX", "BANKNIFTY")):
             breeze_symbol = stock_mapper.get_breeze_symbol(stock_code)
-            print(breeze_symbol)
 
             # Log the conversion for debugging
             if breeze_symbol != stock_code:
@@ -355,13 +344,9 @@ def get_historical_data(stock_code, exchange_code, interval="1day", days=300):
                 logging.debug(
                     f"Last data point datetime: {df['datetime'].iloc[-1] if len(df) > 0 else 'None'}"
                 )
-
-                # Update final outcome
-                final_outcome = "Success"
                 return df
             else:
                 logging.warning(f"No data points returned for {stock_code}")
-                final_outcome = "No data points"
                 return pd.DataFrame()
         else:
             error_msg = hist_data.get("Error", "Unknown error") if hist_data else "None"
@@ -372,18 +357,12 @@ def get_historical_data(stock_code, exchange_code, interval="1day", days=300):
             logging.error(
                 f"Full response: {json.dumps(hist_data, indent=2) if hist_data else 'None'}"
             )
-            final_outcome = "API error"
             return pd.DataFrame()
 
     except Exception as e:
         logging.error(f"Error fetching historical data for {stock_code}: {str(e)}")
         logging.exception("Stack trace:")
-        final_outcome = "Exception"
         return pd.DataFrame()
-
-    finally:
-        # Log the final outcome of this attempt
-        logging.info(f"Final outcome for {stock_code}: {final_outcome}")
 
 
 def _find_price_in_dict(data: Dict[str, Any]) -> Optional[float]:
@@ -843,21 +822,10 @@ def analyze_market_condition(index_data):
 
 
 def check_buy_signal(df, market_condition, min_points=30):
-    """
-    Check for buy signals with criteria for mid-term trading
-
-    Args:
-        df (pandas.DataFrame): Historical data with indicators
-        market_condition (dict): Current market condition analysis
-        min_points (int): Minimum number of data points required
-
-    Returns:
-        tuple: (bool, str) - Signal and reason
-    """
+    """Enhanced version of your existing buy signal"""
     if df is None or df.empty:
         return False, "No data available"
 
-    # Adjust minimum points based on available data
     available_points = len(df)
     if available_points < min_points:
         return (
@@ -866,13 +834,36 @@ def check_buy_signal(df, market_condition, min_points=30):
         )
 
     try:
-        # Get the latest values
         latest = df.iloc[-1]
         previous = df.iloc[-2]
 
         signal_reasons = []
-        score = 0  # Score-based approach for multiple factors
+        score = 0
 
+        # Check for multiple timeframe momentum
+        price_3d = (
+            ((latest["close"] / df["close"].iloc[-4]) - 1) * 100 if len(df) >= 4 else 0
+        )
+        price_5d = (
+            ((latest["close"] / df["close"].iloc[-6]) - 1) * 100 if len(df) >= 6 else 0
+        )
+
+        # Strong recent momentum (key for 1-month trades)
+        if price_3d >= 2:  # 2% in 3 days
+            signal_reasons.append(f"Strong 3-day momentum: {price_3d:.1f}%")
+            score += 2
+        elif price_5d >= 3:  # 3% in 5 days
+            signal_reasons.append(f"Good 5-day momentum: {price_5d:.1f}%")
+            score += 1
+
+        # Volume surge check (critical for quick moves)
+        avg_volume_20 = df["volume"].tail(20).mean()
+        recent_volume = df["volume"].tail(3).mean()
+        if recent_volume > (avg_volume_20 * 1.5):  # 50% above average
+            signal_reasons.append("Volume surge detected")
+            score += 2
+
+        # Keep your existing RSI, MACD, SMA logic here...
         # RSI oversold signal
         if previous["rsi"] < RSI_OVERSOLD and latest["rsi"] > RSI_OVERSOLD:
             signal_reasons.append(f"RSI crossed above oversold ({latest['rsi']:.1f})")
@@ -887,7 +878,7 @@ def check_buy_signal(df, market_condition, min_points=30):
             signal_reasons.append("Price above 50-day SMA")
             score += 1
 
-        # MACD cross or histogram increasing (bullish momentum)
+        # MACD signals
         macd_cross = (
             previous["macd"] < previous["macd_signal"]
             and latest["macd"] > latest["macd_signal"]
@@ -903,25 +894,15 @@ def check_buy_signal(df, market_condition, min_points=30):
             signal_reasons.append("MACD histogram increasing")
             score += 1
 
-        if latest["close"] > latest["open"]:
-            signal_reasons.append("Current day is positive")
-            score += 0.5
-
-        # To:
-        min_score = 3  # Lowered base score from 4 to 3
+        # NEW: Minimum score adjustment for active trading
+        min_score = 4  # Lowered for more opportunities
         if market_condition.get("trend", "neutral") == "bullish":
-            min_score = 2.5  # Even lower in bullish market
+            min_score = 3
         elif market_condition.get("trend", "neutral") == "bearish":
-            min_score = 4  # Still strict in bearish market
-
-        # Buy signal metrics
-        logging.debug(
-            f"Stock indicators: RSI={latest.get('rsi', 'NaN')}, "
-            f"MACD Cross: {previous['macd'] < previous['macd_signal'] and latest['macd'] > latest['macd_signal']}"
-        )
+            min_score = 5
 
         if score >= min_score:
-            return True, f"Multiple buy signals detected: {', '.join(signal_reasons)}"
+            return True, f"Buy signals detected: {', '.join(signal_reasons)}"
         else:
             return (
                 False,
@@ -931,6 +912,22 @@ def check_buy_signal(df, market_condition, min_points=30):
     except Exception as e:
         logging.error(f"Error checking buy signal: {str(e)}")
         return False, f"Error: {str(e)}"
+
+
+def store_entry_context(stock_code, signal_reason):
+    """Store why we entered this position"""
+    if stock_code in positions:
+        positions[stock_code]["entry_reason"] = signal_reason
+        positions[stock_code]["entry_date"] = datetime.datetime.now().isoformat()
+
+        # Set expected timeframe based on entry reason
+        if (
+            "momentum" in signal_reason.lower()
+            or "volume surge" in signal_reason.lower()
+        ):
+            positions[stock_code]["expected_duration"] = "1-3_weeks"
+        else:
+            positions[stock_code]["expected_duration"] = "2-4_weeks"
 
 
 def update_trailing_stops():
@@ -964,6 +961,9 @@ def update_trailing_stops():
 
             # Calculate profit percentage
             profit_percent = ((current_price / entry_price) - 1) * 100
+            logging.warning(
+                f"Profit percentage for {stock_code}: {profit_percent:.2f}%"
+            )
 
             # Update stop loss based on profit level
             new_stop_loss = current_stop
@@ -982,7 +982,7 @@ def update_trailing_stops():
             # Update if we have a higher stop loss
             if new_stop_loss > current_stop:
                 positions[stock_code]["stop_loss"] = new_stop_loss
-                logging.info(
+                logging.warning(
                     f"Updated trailing stop for {stock_code}: {current_stop:.2f} -> {new_stop_loss:.2f}"
                 )
                 updated_count += 1
@@ -997,13 +997,18 @@ def update_trailing_stops():
     return updated_count
 
 
-def check_sell_signal(df, entry_price):
+def check_sell_signal(df, entry_price, days_held=0, market_condition=None):
     """
-    Check for sell signals in the data, adjusted for mid-term trading
+    CONSOLIDATED sell signal function with ALL exit logic
+    - Technical analysis
+    - Time-based rules
+    - Market condition overrides
 
     Args:
         df (pandas.DataFrame): Historical data with indicators
         entry_price (float): Entry price for position
+        days_held (int): Days position has been held
+        market_condition (dict): Current market condition
 
     Returns:
         tuple: (bool, str) - Signal and reason
@@ -1012,57 +1017,200 @@ def check_sell_signal(df, entry_price):
         return False, "Insufficient data"
 
     try:
-        # Get the latest values
         latest = df.iloc[-1]
         previous = df.iloc[-2]
+        current_price = latest["close"]
+        profit_percent = ((current_price / entry_price) - 1) * 100
 
-        # Calculate current profit/loss percentage
-        profit_percent = ((latest["close"] / entry_price) - 1) * 100
+        # ============================================
+        # 1. TIME-BASED EXIT RULES (Week by Week)
+        # ============================================
 
-        # Check exit conditions - adjusted for mid-term trading
-        exit_reasons = []
+        # WEEK 1 (Days 1-7): Quick profit taking and early loss control
+        if days_held <= 7:
+            # Take quick profits
+            if profit_percent >= 8:
+                return (
+                    True,
+                    f"Week 1 quick profit: {profit_percent:.1f}% in {days_held} days",
+                )
 
-        # 1. RSI extremely overbought (increased threshold for mid-term)
-        if previous["rsi"] < 80 and latest["rsi"] > 80:  # Increased from 70 to 80
-            exit_reasons.append(
-                f"RSI crossed above extreme overbought ({latest['rsi']:.1f})"
-            )
+            # Early loss control
+            if profit_percent <= -3 and days_held >= 3:
+                return (
+                    True,
+                    f"Week 1 loss control: {profit_percent:.1f}% after {days_held} days",
+                )
 
-        # 2. Price drops below 50-day SMA (trend change) - use longer timeframe for mid-term
-        if (
-            previous["close"] > previous["sma_50"]
-            and latest["close"] < latest["sma_50"]
-        ):
-            exit_reasons.append("Price crossed below 50-day SMA")
+            # End of week 1 checkpoint
+            if days_held == 7 and profit_percent < 1:
+                return True, f"Week 1 checkpoint failed: {profit_percent:.1f}%"
 
-        # 3. MACD bearish cross with confirmation
-        if (
+        # WEEK 2 (Days 8-14): Standard performance expectations
+        elif days_held <= 14:
+            # Good profit target
+            if profit_percent >= 10:
+                return (
+                    True,
+                    f"Week 2 target achieved: {profit_percent:.1f}% in {days_held} days",
+                )
+
+            # Underperformance check
+            if profit_percent < 2 and days_held >= 10:
+                return (
+                    True,
+                    f"Week 2 underperformance: {profit_percent:.1f}% after {days_held} days",
+                )
+
+            # Week 2 checkpoint
+            if days_held == 14 and profit_percent < 3:
+                return True, f"Week 2 checkpoint failed: {profit_percent:.1f}%"
+
+        # WEEK 3 (Days 15-21): Higher expectations
+        elif days_held <= 21:
+            # Higher profit target
+            if profit_percent >= 12:
+                return (
+                    True,
+                    f"Week 3 strong performance: {profit_percent:.1f}% in {days_held} days",
+                )
+
+            # Week 3 underperformance
+            if profit_percent < 4 and days_held >= 18:
+                return (
+                    True,
+                    f"Week 3 underperformance: {profit_percent:.1f}% after {days_held} days",
+                )
+
+            # Week 3 checkpoint
+            if days_held == 21 and profit_percent < 5:
+                return True, f"Week 3 checkpoint failed: {profit_percent:.1f}%"
+
+        # WEEK 4+ (Days 22-30): Final stretch
+        elif days_held <= 30:
+            # Take decent profits in final week
+            if profit_percent >= 8:
+                return (
+                    True,
+                    f"Week 4 profit taking: {profit_percent:.1f}% after {days_held} days",
+                )
+
+            # Limit losses in final week
+            if profit_percent <= -2:
+                return (
+                    True,
+                    f"Week 4 loss limitation: {profit_percent:.1f}% after {days_held} days",
+                )
+
+            # Approaching maximum
+            if days_held >= 28:
+                return (
+                    True,
+                    f"Approaching max holding: {profit_percent:.1f}% after {days_held} days",
+                )
+
+        # MAXIMUM HOLDING PERIOD (30+ days): Forced exit
+        else:  # days_held > 30
+            if profit_percent > 0:
+                return (
+                    True,
+                    f"Max holding period with profit: {profit_percent:.1f}% after {days_held} days",
+                )
+            else:
+                return (
+                    True,
+                    f"Max holding period reached: {profit_percent:.1f}% after {days_held} days",
+                )
+
+        # ============================================
+        # 2. TECHNICAL ANALYSIS EXIT RULES
+        # ============================================
+
+        # Only check technical rules if time-based rules didn't trigger
+
+        # A) PROFIT TARGETS (if time rules didn't catch them)
+        if profit_percent >= 15:  # Very high profit - always take
+            return True, f"Excellent profit target: {profit_percent:.2f}%"
+
+        # B) STOP LOSS (Dynamic based on time held)
+        if days_held <= 7:
+            stop_threshold = -4.0  # Wider stop early
+        elif days_held <= 14:
+            stop_threshold = -3.5  # Medium stop
+        else:
+            stop_threshold = -3.0  # Tighter stop later
+
+        if profit_percent <= stop_threshold:
+            return True, f"Technical stop loss: {profit_percent:.2f}%"
+
+        # C) MOMENTUM BREAKDOWN
+        momentum_broken = (
             previous["macd"] > previous["macd_signal"]
             and latest["macd"] < latest["macd_signal"]
-            and latest["macd_hist"] < 0
-        ):  # Added histogram confirmation
-            exit_reasons.append("MACD bearish cross with confirmation")
+            and latest["macd_hist"] < -0.2  # Significant negative
+            and latest["rsi"] < 40  # RSI weak too
+        )
 
-        # 4. Higher profit target for mid-term
-        if profit_percent >= 10.0:  # Increased from 5% to 10%
-            exit_reasons.append(
-                f"Mid-term profit target reached ({profit_percent:.2f}%)"
-            )
+        if momentum_broken and profit_percent < 6:
+            return True, f"Technical momentum breakdown after {days_held} days"
 
-        # 5. Wider stop loss for mid-term
-        if profit_percent <= -5.0:  # Increased from -2% to -5%
-            exit_reasons.append(f"Mid-term stop loss triggered ({profit_percent:.2f}%)")
+        # D) VOLUME MOMENTUM FADING
+        if days_held >= 5:  # Only check after 5 days
+            avg_volume_20 = df["volume"].tail(20).mean()
+            recent_volume = df["volume"].tail(3).mean()
+            volume_dried = recent_volume < (avg_volume_20 * 0.7)
 
-        # Final decision
-        if exit_reasons:
-            reason = ", ".join(exit_reasons)
-            logging.warning(f"Mid-term sell signal detected for {stock_code}: {reason}")
-            return True, reason
+            if volume_dried and profit_percent < 5:
+                return True, f"Volume momentum fading after {days_held} days"
 
-        return False, "No mid-term sell criteria met"
+        # E) RSI EXTREME OVERBOUGHT (with profit)
+        if latest["rsi"] > 78 and profit_percent >= 8:
+            return True, f"RSI extreme overbought with profit: {profit_percent:.2f}%"
+
+        # F) PRICE BELOW KEY SUPPORT
+        if days_held >= 7:  # Only after week 1
+            # Check if price broke below 20-day SMA significantly
+            if (
+                previous["close"] > previous["sma_20"]
+                and latest["close"] < latest["sma_20"] * 0.97
+            ):  # 3% below SMA
+                return True, f"Broke key support after {days_held} days"
+
+        # ============================================
+        # 3. MARKET CONDITION OVERRIDES
+        # ============================================
+
+        if market_condition:
+            market_trend = market_condition.get("trend", "neutral")
+            market_vs_sma200 = market_condition.get("close_vs_sma200", 0)
+
+            # Market crash protection
+            if (
+                market_trend == "bearish"
+                and market_vs_sma200 < -8  # Market down 8%+ from 200-day SMA
+                and profit_percent > -3
+            ):  # Preserve capital
+                return (
+                    True,
+                    f"Market crash protection: {profit_percent:.1f}% after {days_held} days",
+                )
+
+            # Market turning bearish - be more aggressive
+            if market_trend == "bearish" and days_held >= 14:
+                if profit_percent >= 5:  # Take smaller profits
+                    return (
+                        True,
+                        f"Market bearish - taking {profit_percent:.1f}% profit after {days_held} days",
+                    )
+
+        # ============================================
+        # 4. NO EXIT SIGNAL
+        # ============================================
+
+        return False, f"Hold: {profit_percent:.1f}% profit after {days_held} days"
 
     except Exception as e:
-        logging.error(f"Error checking mid-term sell signal: {e}")
+        logging.error(f"Error in sell signal analysis: {e}")
         return False, f"Error: {str(e)}"
 
 
@@ -1154,124 +1302,27 @@ def enter_position(stock_code, exchange_code="NSE"):
         positions[stock_code] = {
             "exchange": exchange_code,
             "quantity": quantity,
-            "entry_price": current_price,  # Fallback
+            "entry_price": current_price,
             "entry_time": datetime.datetime.now().isoformat(),
             "stop_loss": stop_loss_price,
             "position_value": current_price * quantity,
         }
         save_positions()
 
-        # Wait for order execution (poll order status)
-        max_wait_time = 60  # seconds
-        wait_interval = 2  # seconds
-        waited_time = 0
-        executed_price = 0
-        order_status = None
-        order_status_history = []
+        # Wait for execution
+        success, executed_price, filled_qty, order_status_history = (
+            wait_for_order_execution(order_id, stock_code, exchange_code, current_price)
+        )
 
-        while waited_time < max_wait_time:
-            try:
-                # Get order status
-                order_status = breeze.get_order_detail(
-                    order_id=order_id, exchange_code=exchange_code or "NSE"
-                )
-                logging.info(f"Order details: {order_status}")
-
-                # Check if we got a valid response with Success list
-                if (
-                    not order_status.get("Success")
-                    or not isinstance(order_status["Success"], list)
-                    or len(order_status["Success"]) == 0
-                ):
-                    logging.warning(
-                        f"Unexpected order status response format: {order_status}"
-                    )
-                    time.sleep(wait_interval)
-                    waited_time += wait_interval
-                    continue
-
-                # Get the first order in the Success list
-                order_info = order_status["Success"][0]
-                status = order_info.get("status", "Unknown")
-
-                # Calculate filled quantity and get entry price
-                try:
-                    quantity = int(order_info.get("quantity", 0))
-                    pending_qty = int(order_info.get("pending_quantity", 0))
-                    filled_qty = quantity - pending_qty
-                    entry_price = float(order_info.get("average_price", current_price))
-                except (ValueError, TypeError):
-                    filled_qty = 0
-                    entry_price = current_price
-
-                logging.info(
-                    f"Order status for {stock_code} (ID: {order_id}): {status}, "
-                    f"Filled: {filled_qty}/{order_info.get('quantity')}, "
-                    f"Price: {entry_price:.2f}"
-                )
-
-                # Track status history
-                order_status_history.append((datetime.datetime.now(), status))
-
-                # Handle different order statuses
-                if status == "Executed":
-                    try:
-                        executed_price = float(
-                            order_info.get("average_price", current_price)
-                        )
-                        logging.info(f"Order executed at price: {executed_price}")
-
-                        # Update position with executed price
-                        if stock_code in positions:
-                            positions[stock_code]["entry_price"] = executed_price
-                            positions[stock_code]["position_value"] = (
-                                executed_price * quantity
-                            )
-                            save_positions()
-
-                    except (ValueError, TypeError):
-                        logging.error(f"Invalid price in order response: {order_info}")
-                        return False, 0
-
-                elif status in ["Cancelled", "Rejected", "Expired"]:
-                    logging.warning(f"Order {status} for {stock_code}")
-                    if stock_code in positions:
-                        del positions[stock_code]
-                        save_positions()
-                    return False, 0
-
-                # If order is still pending, wait and check again
-                time.sleep(wait_interval)
-                waited_time += wait_interval
-
-            except Exception as e:
-                logging.error(f"Error checking order status: {e}")
-                time.sleep(wait_interval)
-                waited_time += wait_interval
-
-        if executed_price == 0:
-            # Log the status history for debugging
-            logging.error(
-                f"Order for {stock_code} did not execute within expected time"
-            )
-            logging.error("Order status history:")
-            for timestamp, status in order_status_history:
-                logging.error(f"{timestamp}: {status}")
-
-            del positions[stock_code]
-            save_positions()
-
-            # Try to cancel the order if it's still pending
-            if order_status and order_status.get("Status") == "Pending":
-                try:
-                    cancel_response = breeze.cancel_order(order_id=order_id)
-                    logging.info(
-                        f"Attempted to cancel pending order: {cancel_response}"
-                    )
-                except Exception as e:
-                    logging.error(f"Error cancelling order: {e}")
-
+        if not success or executed_price == 0:
+            # Order failed - clean up
+            if stock_code in positions:
+                del positions[stock_code]
+                save_positions()
             return False
+
+        # Store entry context for better exit decisions
+        store_entry_context(stock_code, "Technical entry signal")
 
         # Send email notification
         email_subject = f"New Position: {stock_code}"
@@ -1284,7 +1335,7 @@ def enter_position(stock_code, exchange_code="NSE"):
         Quantity: {quantity}
         Position Value: ₹{executed_price * quantity:.2f}
         Stop Loss: ₹{stop_loss_price:.2f}
-        Entry Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}
+        Entry Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         This position represents {(executed_price * quantity / INITIAL_CAPITAL) * 100:.1f}% of your trading capital.
         """
@@ -1295,6 +1346,110 @@ def enter_position(stock_code, exchange_code="NSE"):
     except Exception as e:
         logging.error(f"Exception in enter_position for {stock_code}: {e}")
         return False
+
+
+def wait_for_order_execution(
+    order_id,
+    stock_code,
+    exchange_code,
+    current_price,
+    max_wait_time=MAX_WAIT_TIME_ORDER,
+    wait_interval=2,
+):
+    """
+    Wait for order execution and return execution details.
+
+    Returns:
+        tuple: (success: bool, executed_price: float, filled_quantity: int, order_status_history: list)
+    """
+    start_time = time.time()
+    order_status_history = []
+    last_order_status = None
+
+    while time.time() - start_time < max_wait_time:
+        try:
+            # Get order status
+            order_status = breeze.get_order_detail(
+                order_id=order_id, exchange_code=exchange_code or "NSE"
+            )
+            last_order_status = order_status  # Keep track of last status
+
+            # Validate response structure
+            if not (
+                order_status
+                and isinstance(order_status.get("Success"), list)
+                and order_status["Success"]
+            ):
+                logging.warning(f"Invalid order response: {order_status}")
+                time.sleep(wait_interval)
+                continue
+
+            # Extract order info
+            order_info = order_status["Success"][0]
+            status = order_info.get("status", "Unknown")
+
+            # Track status history for debugging
+            order_status_history.append((datetime.datetime.now(), status))
+
+            # Parse quantities and price safely
+            try:
+                quantity = int(order_info.get("quantity", 0))
+                pending_qty = int(order_info.get("pending_quantity", 0))
+                filled_qty = quantity - pending_qty
+                avg_price = float(order_info.get("average_price", 0))
+                executed_price = avg_price if avg_price > 0 else current_price
+            except (ValueError, TypeError) as e:
+                logging.error(f"Error parsing order data: {e}")
+                time.sleep(wait_interval)
+                continue
+
+            logging.info(
+                f"Order {order_id} for {stock_code}: Status={status}, "
+                f"Filled={filled_qty}/{quantity}, Price={executed_price:.2f}"
+            )
+
+            # Check order status
+            if status == "Executed":
+                logging.info(f"Order executed at price: {executed_price}")
+                return True, executed_price, filled_qty, order_status_history
+
+            elif status in ["Cancelled", "Rejected", "Expired"]:
+                logging.warning(f"Order {order_id} {status} for {stock_code}")
+                return False, 0, 0, order_status_history
+
+            # Order still pending - continue waiting
+            time.sleep(wait_interval)
+
+        except Exception as e:
+            logging.error(f"Error checking order {order_id}: {e}")
+            time.sleep(wait_interval)
+
+    # Timeout reached - log history for debugging
+    logging.error(f"Order for {stock_code} did not execute within expected time")
+    logging.error("Order status history:")
+    for timestamp, status in order_status_history:
+        logging.error(f"{timestamp}: {status}")
+
+    # Try to cancel pending order - check last known status
+    if last_order_status:
+        # Check if the last status indicates pending
+        # Note: You were checking order_status.get("Status") but based on the code,
+        # the status is inside Success[0].get("status"), not at the top level
+        try:
+            if (
+                last_order_status.get("Success")
+                and len(last_order_status["Success"]) > 0
+            ):
+                last_status = last_order_status["Success"][0].get("status")
+                if last_status == "Pending":
+                    cancel_response = breeze.cancel_order(order_id=order_id)
+                    logging.info(
+                        f"Attempted to cancel pending order: {cancel_response}"
+                    )
+        except Exception as e:
+            logging.error(f"Error cancelling order: {e}")
+
+    return False, 0, 0, order_status_history
 
 
 def calculate_position_size(current_price, stop_loss_price, stock_code):
@@ -1409,7 +1564,7 @@ def exit_position(stock_code, exit_reason="Manual"):
         logging.warning(f"Sell order placed for {stock_code}, order ID: {order_id}")
 
         # Wait for order execution (poll order status)
-        max_wait_time = 60  # seconds
+        max_wait_time = MAX_WAIT_TIME_ORDER  # seconds
         wait_interval = 2  # seconds
         waited_time = 0
         executed_price = 0
@@ -1464,7 +1619,7 @@ def exit_position(stock_code, exit_reason="Manual"):
                             order_info.get("average_price", current_price)
                         )
                         logging.warning(
-                            f"Sell order executed for {stock_code} at {executed_price}"
+                            f"Sell order executed for {stock_code} at {executed_price}  - (ID: {order_id})"
                         )
                         break
                     except (ValueError, TypeError):
@@ -1472,7 +1627,9 @@ def exit_position(stock_code, exit_reason="Manual"):
                         return False
 
                 elif status in ["Cancelled", "Rejected", "Expired"]:
-                    logging.warning(f"Sell order {status} for {stock_code}")
+                    logging.warning(
+                        f"Sell order {status} for {stock_code} - (ID: {order_id})"
+                    )
                     return False
 
                 # If order is still pending, wait and check again
@@ -1482,7 +1639,6 @@ def exit_position(stock_code, exit_reason="Manual"):
             except Exception as e:
                 logging.error(f"Error checking order status: {e}")
                 time.sleep(wait_interval)
-                waited_time += wait_interval
 
         if executed_price == 0:
             # Log the status history for debugging
@@ -1509,13 +1665,13 @@ def exit_position(stock_code, exit_reason="Manual"):
                     except Exception as e:
                         logging.error(f"Error cancelling order: {e}")
 
-            return False
+                return False
 
         # Calculate profit/loss
         profit_loss = (executed_price - entry_price) * quantity
         profit_loss_percent = ((executed_price / entry_price) - 1) * 100
 
-        logging.info(
+        logging.warning(
             f"Closed position for {stock_code}: P&L = ₹{profit_loss:.2f} ({profit_loss_percent:.2f}%)"
         )
 
@@ -1583,7 +1739,6 @@ def save_positions():
             json.dump(positions, f, indent=4)
 
         logging.info(f"Saved {len(positions)} positions to {filename}")
-        logging.info(f"Positions saved: {positions}")
     except Exception as e:
         logging.error(f"Error saving positions: {e}")
 
@@ -2022,120 +2177,80 @@ def screen_stocks(stock_universe, market_condition, max_stocks=100, interval="1d
 
 def manage_positions(market_condition):
     """
-    Manage existing positions with mid-term criteria
-
-    Args:
-        market_condition (dict): Current market condition
-
-    Returns:
-        int: Number of positions exited
+    SIMPLIFIED position management - only handles data collection
+    ALL exit logic is in check_sell_signal()
     """
-    positions_to_check = list(positions.items())  # Get a snapshot of current positions
+    positions_to_check = list(positions.items())
     exited_count = 0
-    MIN_HOLDING_DAYS = 1  # Minimum days to hold a position
-    EXTREME_BEARISH_EXIT_THRESHOLD = (
-        -2.0
-    )  # Max loss % to accept in extreme bearish market
+    MIN_HOLDING_DAYS = 1  # Prevent overtrading
 
     for stock_code, position in positions_to_check:
-        logging.debug(f"Processing position for {stock_code}")
-
-        # Skip if position no longer exists or is already being processed
         if stock_code not in positions or position.get("exiting", False):
             continue
 
         try:
-            # Mark position as being processed
             positions[stock_code]["exiting"] = True
             exchange_code = position["exchange"]
             entry_price = position["entry_price"]
             entry_time = position.get("entry_time")
 
-            # Skip if position is too new
+            # Calculate days held
+            days_held = 0
             if entry_time:
-                entry_date = datetime.datetime.fromisoformat(entry_time)
-                days_held = (datetime.datetime.now() - entry_date).days
-                if days_held < MIN_HOLDING_DAYS:
-                    logging.debug(
-                        f"Skipping {stock_code}: Only held for {days_held} days (min: {MIN_HOLDING_DAYS} days)"
-                    )
-                    continue
+                try:
+                    entry_date = datetime.datetime.fromisoformat(entry_time)
+                    time_diff = datetime.datetime.now() - entry_date
+                    days_held = time_diff.days
 
-            # Get current price first to minimize time between checks
-            current_price = get_current_price(stock_code, exchange_code)
-            if current_price is None:
-                logging.debug(f"Skipping {stock_code}: Failed to get current price")
+                    # Handle same-day positions
+                    if days_held == 0:
+                        hours_held = time_diff.total_seconds() / 3600
+                        if hours_held >= 6:
+                            days_held = 1
+
+                except Exception as e:
+                    logging.warning(f"Error parsing entry_time for {stock_code}: {e}")
+                    days_held = 1
+
+            # Skip if too new (prevent overtrading)
+            if days_held < MIN_HOLDING_DAYS:
                 continue
 
-            logging.debug(f"{stock_code} current price: {current_price:.2f}")
+            # Get current price
+            current_price = get_current_price(stock_code, exchange_code)
+            if current_price is None:
+                continue
 
-            # Check trailing stop first (fastest check)
-            if "stop_loss" in position and position["stop_loss"] > 0:
-                if current_price < position["stop_loss"]:
-                    logging.info(
-                        f"{stock_code}: Stop loss triggered (Price: {current_price:.2f} < Stop: {position['stop_loss']:.2f})"
-                    )
-                    if exit_position(stock_code, exit_reason="Trailing stop hit"):
-                        exited_count += 1
-                        continue
-                else:
-                    logging.debug(
-                        f"{stock_code}: No stop loss hit (Price: {current_price:.2f} >= Stop: {position['stop_loss']:.2f})"
-                    )
-            else:
-                logging.debug(f"{stock_code}: No valid stop loss set")
+            # Calculate current profit for logging
+            profit_percent = ((current_price / entry_price) - 1) * 100
+            logging.info(
+                f"{stock_code}: {profit_percent:.2f}% profit after {days_held} days"
+            )
 
-            # Get historical data only if needed
+            # Get historical data and indicators
             hist_data = get_historical_data(stock_code, exchange_code)
             if hist_data is None:
                 continue
 
-            # Calculate indicators
             with_indicators = calculate_indicators(hist_data)
             if with_indicators is None:
                 continue
 
-            # Check for sell signal using mid-term criteria
-            sell_signal, reason = check_sell_signal(with_indicators, entry_price)
-            logging.warning(
-                f"{stock_code}: Sell signal check - Signal: {sell_signal}, Reason: {reason}"
+            # ============================================
+            # Sell signal check
+            # ============================================
+
+            sell_signal, reason = check_sell_signal(
+                with_indicators, entry_price, days_held, market_condition
             )
 
-            # Exit based on signal
             if sell_signal:
-                logging.warning(f"{stock_code}: Exiting position - {reason}")
+                logging.warning(f"{stock_code}: Exit triggered - {reason}")
                 if exit_position(stock_code, exit_reason=reason):
                     exited_count += 1
-                    continue
-                else:
-                    logging.warning(
-                        f"{stock_code}: Failed to exit position despite sell signal"
-                    )
-
-            # Additional exit only if market turned extremely bearish
-            if (
-                market_condition["trend"] == "bearish"
-                and market_condition["strength"] == "strong"
-                and market_condition.get("close_vs_sma200", 0) < -5
-            ):
-                profit_percent = ((current_price / entry_price) - 1) * 100
-                if profit_percent > EXTREME_BEARISH_EXIT_THRESHOLD:
-                    reason = (
-                        f"Extreme bearish market condition (P&L: {profit_percent:.2f}%)"
-                    )
-                    if exit_position(stock_code, exit_reason=reason):
-                        exited_count += 1
-                        logging.warning(
-                            f"{stock_code}: Exited due to extreme bearish market"
-                        )
-                    else:
-                        logging.warning(
-                            f"{stock_code}: Failed to exit position in extreme bearish market"
-                        )
 
         except Exception as e:
             logging.error(f"Error managing position for {stock_code}: {e}")
-            logging.error(traceback.format_exc())
         finally:
             if stock_code in positions:
                 positions[stock_code].pop("exiting", None)
@@ -2143,9 +2258,21 @@ def manage_positions(market_condition):
     return exited_count
 
 
+price_cache = {}
+
+
+def get_cached_price(stock_code, exchange_code):
+    """
+    Get the current price of a stock from cache or fetch it if not cached.
+    """
+    global price_cache
+    if stock_code not in price_cache:
+        price_cache[stock_code] = get_current_price(stock_code, exchange_code)
+    return price_cache[stock_code]
+
+
 def generate_daily_report():
     """Generate and send daily trading report"""
-    # Calculate daily P&L
     global positions, today_trades
     load_positions()
     load_today_trades()
@@ -2154,24 +2281,23 @@ def generate_daily_report():
     for trade in today_trades:
         daily_pnl += trade.get("profit_loss", 0)
 
-    # Count trades
     total_trades = len(today_trades)
     winning_trades = sum(1 for trade in today_trades if trade.get("profit_loss", 0) > 0)
     losing_trades = sum(1 for trade in today_trades if trade.get("profit_loss", 0) < 0)
 
-    # Calculate win rate
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
 
-    # Check current positions
     current_positions_value = 0
     unrealized_pnl = 0
+
+    # log existing positions status
+    log_position_status()
 
     for stock_code, position in positions.items():
         quantity = position.get("quantity", 0)
         entry_price = position.get("entry_price", 0)
 
-        # Get current price
-        current_price = get_current_price(stock_code, position.get("exchange", "NSE"))
+        current_price = get_cached_price(stock_code, position.get("exchange", "NSE"))
 
         if current_price:
             position_value = current_price * quantity
@@ -2180,39 +2306,33 @@ def generate_daily_report():
             current_positions_value += position_value
             unrealized_pnl += position_pnl
 
-    # Create report
-    report = f"""
-    DAILY TRADING REPORT - {datetime.datetime.now().strftime('%Y-%m-%d')}
-    =======================================================
+    report = f"""DAILY TRADING REPORT - {datetime.datetime.now().strftime('%Y-%m-%d')}
+=======================================================
 
-    PERFORMANCE SUMMARY:
-    --------------------
-    Realized P&L: ₹{daily_pnl:.2f}
-    Unrealized P&L: ₹{unrealized_pnl:.2f}
-    Total P&L: ₹{daily_pnl + unrealized_pnl:.2f}
+PERFORMANCE SUMMARY:
+--------------------
+Realized P&L: ₹{daily_pnl:.2f}
+Unrealized P&L: ₹{unrealized_pnl:.2f}
+Total P&L: ₹{daily_pnl + unrealized_pnl:.2f}
 
-    TRADING ACTIVITY:
-    -----------------
-    Total Trades: {total_trades}
-    Winning Trades: {winning_trades}
-    Losing Trades: {losing_trades}
-    Win Rate: {win_rate:.1f}%
+TRADING ACTIVITY:
+-----------------
+Total Trades: {total_trades}
+Winning Trades: {winning_trades}
+Losing Trades: {losing_trades}
+Win Rate: {win_rate:.1f}%
 
-    CURRENT POSITIONS:
-    -----------------
-    """
+CURRENT POSITIONS:
+-----------------"""
 
-    # Add current positions
     if positions:
-        report += "CURRENT POSITIONS:\n"
-        report += "-----------------\n"
         for stock_code, position in positions.items():
             entry_price = position.get("entry_price", 0)
             quantity = position.get("quantity", 0)
             stop_loss = position.get("stop_loss", 0)
             entry_time = position.get("entry_time", "Unknown")
 
-            current_price = get_current_price(
+            current_price = get_cached_price(
                 stock_code, position.get("exchange", "NSE")
             )
 
@@ -2221,47 +2341,43 @@ def generate_daily_report():
                 pnl_percent = ((current_price / entry_price) - 1) * 100
 
                 report += f"""
-                {stock_code}:
-                Entry Price: ₹{entry_price:.2f}
-                Current Price: ₹{current_price:.2f}
-                Quantity: {quantity}
-                Stop Loss: ₹{stop_loss:.2f}
-                Unrealized P&L: ₹{pnl:.2f} ({pnl_percent:.2f}%)
-                Held Since: {entry_time}\n
-                """
+{stock_code}:
+    Entry Price: ₹{entry_price:.2f}
+    Current Price: ₹{current_price:.2f}
+    Quantity: {quantity}
+    Stop Loss: ₹{stop_loss:.2f}
+    Unrealized P&L: ₹{pnl:.2f} ({pnl_percent:.2f}%)
+    Held Since: {entry_time}"""
             else:
                 report += f"""
-                {stock_code}:
-                Entry Price: ₹{entry_price:.2f}
-                Current Price: Unable to fetch
-                Quantity: {quantity}
-                Stop Loss: ₹{stop_loss:.2f}
-                Held Since: {entry_time}\n
-                """
+{stock_code}:
+    Entry Price: ₹{entry_price:.2f}
+    Current Price: Unable to fetch
+    Quantity: {quantity}
+    Stop Loss: ₹{stop_loss:.2f}
+    Held Since: {entry_time}"""
+    else:
+        report += "\nNo positions found."
 
-    # Add completed trades section
-    report += "\nCOMPLETED TRADES TODAY:\n"
-    report += "----------------------\n"
+    report += "\n\nCOMPLETED TRADES TODAY:\n"
+    report += "----------------------"
 
     if today_trades:
         for i, trade in enumerate(today_trades, 1):
             report += f"""
-            Trade #{i}:
-            Stock: {trade.get('stock_code', 'Unknown')}
-            Entry: ₹{trade.get('entry_price', 0):.2f}
-            Exit: ₹{trade.get('exit_price', 0):.2f}
-            Quantity: {trade.get('quantity', 0)}
-            P&L: ₹{trade.get('profit_loss', 0):.2f} ({trade.get('profit_loss_percent', 0):.2f}%)
-            Exit Type: {trade.get('exit_type', 'Unknown')}
-            Exit Time: {trade.get('exit_time', 'Unknown')}\n
-            """
+Trade #{i}:
+    Stock: {trade.get('stock_code', 'Unknown')}
+    Entry: ₹{trade.get('entry_price', 0):.2f}
+    Exit: ₹{trade.get('exit_price', 0):.2f}
+    Quantity: {trade.get('quantity', 0)}
+    P&L: ₹{trade.get('profit_loss', 0):.2f} ({trade.get('profit_loss_percent', 0):.2f}%)
+    Exit Type: {trade.get('exit_type', 'Unknown')}
+    Exit Time: {trade.get('exit_time', 'Unknown')}"""
     else:
-        report += "No trades completed today.\n"
+        report += "\nNo trades completed today."
 
-    # Log and save report
     logging.info("Daily report generated")
 
-    # Save report to file
     report_dir = "reports"
     if not os.path.exists(report_dir):
         os.makedirs(report_dir)
@@ -2272,10 +2388,49 @@ def generate_daily_report():
     with open(report_file, "w") as f:
         f.write(report)
 
-    # Send email
     send_email("Trading Daily Report", report)
 
     return report
+
+
+def log_position_status():
+    """Simple position status logging"""
+    global positions
+
+    if not positions:
+        return
+
+    logging.info("=== POSITION STATUS ===")
+    for stock_code, position in positions.items():
+        entry_time = position.get("entry_time")
+        entry_price = position.get("entry_price", 0)
+
+        if entry_time:
+            try:
+                entry_date = datetime.datetime.fromisoformat(entry_time)
+                days_held = (datetime.datetime.now() - entry_date).days
+
+                current_price = get_current_price(
+                    stock_code, position.get("exchange", "NSE")
+                )
+                if current_price and entry_price:
+                    profit_pct = ((current_price / entry_price) - 1) * 100
+
+                    # Week indicator
+                    if days_held <= 7:
+                        week = "W1"
+                    elif days_held <= 14:
+                        week = "W2"
+                    elif days_held <= 21:
+                        week = "W3"
+                    else:
+                        week = f"W4+({days_held}d)"
+
+                    logging.info(
+                        f"{stock_code}: {week} | {profit_pct:+.1f}% | {days_held}d"
+                    )
+            except:
+                pass
 
 
 def run_strategy():
@@ -2298,8 +2453,17 @@ def run_strategy():
 
     try:
         # Get market index data and calculate indicators
-        market_index = "NIFTY"
-        index_data = get_historical_data_index(market_index, "NSE", days=300)
+        market_index = INDEX_FOR_STOCKS
+        #map to actual index identifiers for yahoo api
+        if(market_index == "NIFTY 50"):
+            market_index = "NIFTY"
+        elif(market_index == "SENSEX"):
+            market_index = "SENSEX"
+        elif(market_index == "BANKNIFTY"):
+            market_index = "BANKNIFTY"
+        
+
+        index_data = get_historical_data_index(market_index, days=300)
         if index_data.empty:
             logging.warning("Could not get market index data")
             return False  # Failed to get market data
@@ -2400,12 +2564,6 @@ def run_strategy():
                 logging.warning(
                     f"Already at maximum positions ({len(positions)}/{MAX_POSITIONS})"
                 )
-
-        # Generate daily report at end of day
-        now = datetime.datetime.now().time()
-        if now >= datetime.time(15, 30) and now <= datetime.time(15, 45):
-            generate_daily_report()
-            today_trades = []
 
         # Save positions and trades
         save_positions()

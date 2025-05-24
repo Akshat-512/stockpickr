@@ -19,6 +19,14 @@ NIFTY_50_SYMBOLS = {
 }
 
 class StockMapper:
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls, master_file_path='NSEScripMaster.txt'):
+        if cls._instance is None:
+            cls._instance = super(StockMapper, cls).__new__(cls)
+        return cls._instance
+    
     def __init__(self, master_file_path='NSEScripMaster.txt'):
         """
         Initialize the stock mapper with the master file
@@ -26,10 +34,12 @@ class StockMapper:
         Args:
             master_file_path (str): Path to the master file containing stock information
         """
-        self.master_file = Path(master_file_path)
-        self.symbol_map = {}  # Maps NSE symbol to Breeze symbol
-        self.company_map = {}  # Maps company name to NSE symbol
-        self._load_master_file()
+        if not self._initialized:
+            self.master_file = Path(master_file_path)
+            self.symbol_map = {}  # Maps NSE symbol to Breeze symbol
+            self.company_map = {}  # Maps company name to NSE symbol
+            self._load_master_file()
+            StockMapper._initialized = True
     
     def _load_master_file(self):
         """Load and parse the master file"""
@@ -127,6 +137,7 @@ class StockMapper:
         return symbol in self.symbol_map
 
 # Create a global instance for easy import
+# This will be a singleton instance that's reused throughout the application
 stock_mapper = StockMapper()
 
 # Example usage

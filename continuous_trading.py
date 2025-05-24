@@ -36,7 +36,7 @@ class Config:
     POST_MARKET_CLOSE = datetime.time(15, 45)  # 3:45 PM
 
     # Report generation
-    REPORT_GEN_HOURS = {0, 12}  # Generate reports at midnight and noon
+    REPORT_START_TIME = datetime.time(16, 0)
     REPORT_GEN_WINDOW = 2  # Minutes window for report generation
     REPORTS_DIR = "reports"
 
@@ -46,6 +46,7 @@ class TradingSession:
     """Manages the trading session state."""
 
     day_started: bool = False
+    report_generated_today: bool = False
     day_ended: bool = False
     last_run_time: Optional[datetime.datetime] = None
     positions: Dict[str, Any] = field(default_factory=dict)
@@ -55,6 +56,7 @@ class TradingSession:
         """Reset session state for a new trading day."""
         self.day_started = False
         self.day_ended = False
+        self.report_generated_today = False
         self.today_trades = []
         self.positions = {}
         logging.info("Trading session reset for new day")
@@ -145,44 +147,25 @@ def is_post_market() -> bool:
     return Config.MARKET_CLOSE < now <= Config.POST_MARKET_CLOSE
 
 
-def check_and_generate_report() -> bool:
-    """
-    Check if today's report exists and generate it if missing.
-
-    Returns:
-        bool: True if report was generated or already exists, False on error
-    """
-    try:
-        os.makedirs(Config.REPORTS_DIR, exist_ok=True)
-        today = datetime.date.today()
-        report_file = os.path.join(
-            Config.REPORTS_DIR, f"report_{today.strftime('%Y%m%d')}.txt"
-        )
-
-        if not os.path.exists(report_file):
-            logging.info("Today's report not found. Generating daily report...")
-            trader.generate_daily_report()
-
-            # Verify report was created
-            if os.path.exists(report_file):
-                logging.info(f"Successfully generated report: {report_file}")
-                return True
-            else:
-                logging.error(f"Failed to generate report: {report_file}")
-                return False
-
-        logging.debug("Today's report already exists")
+def check_and_generate_report(session) -> bool:
+    now = datetime.datetime.now()
+    if not (is_market_day() and now.time() >= Config.REPORT_START_TIME):
         return True
-
+    if session.report_generated_today:
+        return True
+    today_str = now.strftime("%Y%m%d")
+    report_file = os.path.join(Config.REPORTS_DIR, f"report_{today_str}.txt")
+    if os.path.exists(report_file):
+        session.report_generated_today = True
+        return True
+    try:
+        trader.generate_daily_report()
+        session.report_generated_today = True
+        trader.today_trades = []
+        return True
     except Exception as e:
-        logging.error(f"Error in check_and_generate_report: {e}", exc_info=True)
+        logging.error(f"Error generating report: {e}")
         return False
-
-
-def generate_daily_report() -> None:
-    """Generate and save daily trading report if it doesn't exist."""
-    if not check_and_generate_report():
-        logging.warning("Failed to ensure daily report exists")
 
 
 def run_trading_cycle(session: TradingSession) -> None:
@@ -192,9 +175,8 @@ def run_trading_cycle(session: TradingSession) -> None:
     # Check for new day
     if session.last_run_time and session.last_run_time.date() != now.date():
         session.reset_for_new_day()
-        generate_daily_report()
 
-    # Log market status
+    # Market status
     logging.info(
         f"Market - Day: {is_market_day()}, "
         f"Hours: {is_during_market_hours()}, "
@@ -202,9 +184,8 @@ def run_trading_cycle(session: TradingSession) -> None:
         f"Post: {is_post_market()}"
     )
 
-    # Generate reports at configured times
-    if now.hour in Config.REPORT_GEN_HOURS and now.minute < Config.REPORT_GEN_WINDOW:
-        generate_daily_report()
+    # Generate report
+    check_and_generate_report(session)
 
     # Run strategy based on market conditions
     if Config.RUN_STRATEGY_OFF_HOURS:
@@ -266,11 +247,9 @@ def run_normal_mode(session: TradingSession, now: datetime.datetime) -> None:
     # Post-market
     elif is_post_market() and not session.day_ended:
         logging.info("Normal Mode: End-of-day procedures")
-        generate_daily_report()
         trader.save_trades()
         session.day_ended = True
     else:
-        generate_daily_report()
         logging.info("Normal Mode: Market closed")
 
 
