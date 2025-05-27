@@ -5,3 +5,5 @@ numpy
 bharat-sm-data
 yfinance
 nsepy
+feedparser
+cryptography

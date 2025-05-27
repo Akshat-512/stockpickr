@@ -15,7 +15,7 @@ import logging
 import signal
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
-
+from session_generator import ManualBreezeAuth
 import trader
 
 
@@ -51,6 +51,7 @@ class TradingSession:
     last_run_time: Optional[datetime.datetime] = None
     positions: Dict[str, Any] = field(default_factory=dict)
     today_trades: list = field(default_factory=list)
+    session_auth: Optional[ManualBreezeAuth] = None
 
     def reset_for_new_day(self):
         """Reset session state for a new trading day."""
@@ -102,25 +103,39 @@ def setup_logging() -> None:
 setup_logging()
 
 
-def refresh_session() -> bool:
-    """Refresh the API session if needed."""
+def ensure_valid_session() -> bool:
+    """Ensure we have a valid session token, automatically refresh if needed."""
     try:
-        test_result = trader.breeze.get_customer_details(
-            api_session=trader.SESSION_TOKEN
-        )
-        if test_result and "Success" in test_result:
-            return True
+        # Create session auth instance
+        session_auth = ManualBreezeAuth()
 
-        logging.warning("Session invalid, attempting to refresh...")
-        if trader.initialize_api():
-            logging.info("Session refreshed successfully")
-            return True
+        # Check for existing valid session (this will automatically use existing if valid)
+        session_token = session_auth.manual_session_generation()
 
-        logging.error("Failed to refresh session")
-        return False
+        if session_token:
+            logging.info(f"✅ Session ready: {session_token}")
+
+            # Update trader module with the session token
+            trader.SESSION_TOKEN = session_token
+
+            # Update config file
+            import configparser
+
+            config = configparser.ConfigParser()
+            config.read("config.ini")
+            if not config.has_section("APICredentials"):
+                config.add_section("APICredentials")
+            config.set("APICredentials", "session_token", session_token)
+            with open("config.ini", "w") as f:
+                config.write(f)
+
+            return True
+        else:
+            logging.error("❌ Failed to get valid session token")
+            return False
 
     except Exception as e:
-        logging.error(f"Error refreshing session: {e}", exc_info=True)
+        logging.error(f"❌ Error ensuring valid session: {e}")
         return False
 
 
@@ -198,11 +213,6 @@ def run_test_mode(session: TradingSession, now: datetime.datetime) -> None:
     """Run trading strategy in test mode."""
     logging.info("Test Mode: Active")
 
-    if not refresh_session():
-        logging.error("Test Mode: Session refresh failed")
-        time.sleep(300)
-        return
-
     if (
         session.last_run_time is None
         or (now - session.last_run_time).seconds >= Config.TEST_MODE_STRATEGY_INTERVAL
@@ -217,11 +227,6 @@ def run_test_mode(session: TradingSession, now: datetime.datetime) -> None:
 def run_normal_mode(session: TradingSession, now: datetime.datetime) -> None:
     """Run trading strategy in normal market mode."""
     if not is_market_day():
-        return
-
-    if not refresh_session():
-        logging.error("Normal Mode: Session refresh failed")
-        time.sleep(300)
         return
 
     # Pre-market
@@ -247,7 +252,6 @@ def run_normal_mode(session: TradingSession, now: datetime.datetime) -> None:
     # Post-market
     elif is_post_market() and not session.day_ended:
         logging.info("Normal Mode: End-of-day procedures")
-        trader.save_trades()
         session.day_ended = True
     else:
         logging.info("Normal Mode: Market closed")
@@ -271,8 +275,8 @@ def run_continuously() -> None:
     """Run the trading strategy continuously."""
     logging.info("Starting continuous trading system")
 
-    if not trader.initialize_api():
-        logging.error("Failed to initialize API. Exiting.")
+    if not ensure_valid_session():
+        logging.error("❌ Failed to get valid session. Exiting.")
         return
 
     session = TradingSession()

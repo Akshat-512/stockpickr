@@ -2461,7 +2461,9 @@ def run_strategy():
             market_index = "SENSEX"
         elif(market_index == "BANKNIFTY"):
             market_index = "BANKNIFTY"
-        
+        else:
+            logging.warning("Invalid market index: " + market_index)
+            return False
 
         index_data = get_historical_data_index(market_index, days=300)
         if index_data.empty:
