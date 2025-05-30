@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 from session_generator import ManualBreezeAuth
 import trader
+from trader import TradingSystem
 
 
 # Configuration
@@ -103,24 +104,40 @@ def setup_logging() -> None:
 setup_logging()
 
 
+# Global variable to track if we're currently in the process of getting a session
+SESSION_REFRESH_IN_PROGRESS = False
+LAST_SESSION_REFRESH_ATTEMPT = 0
+SESSION_REFRESH_COOLDOWN = 60  # 1 minute cooldown between refresh attempts
+
+
 def ensure_valid_session() -> bool:
     """Ensure we have a valid session token, automatically refresh if needed."""
+    session_auth = None
     try:
         # Create session auth instance
         session_auth = ManualBreezeAuth()
 
-        # Check for existing valid session (this will automatically use existing if valid)
+        # Check for existing valid session first
+        existing_token, hours_left = session_auth.check_existing_session()
+        if existing_token and hours_left > 0.5:  # More than 30 minutes left
+            logging.info(
+                f"✅ Using existing valid session (expires in {hours_left:.1f} hours)"
+            )
+            return True
+
+        logging.info("⚠️  No valid session found, attempting to generate new one...")
+
+        # Try to generate new session
         session_token = session_auth.manual_session_generation()
 
-        if session_token:
-            logging.info(f"✅ Session ready: {session_token}")
+        if not session_token:
+            logging.error("❌ Failed to get valid session token")
+            return False
 
-            # Update trader module with the session token
-            trader.SESSION_TOKEN = session_token
+        logging.info(f"✅ New session generated successfully")
 
-            # Update config file
-            import configparser
-
+        # Update config file with new session token
+        try:
             config = configparser.ConfigParser()
             config.read("config.ini")
             if not config.has_section("APICredentials"):
@@ -128,15 +145,21 @@ def ensure_valid_session() -> bool:
             config.set("APICredentials", "session_token", session_token)
             with open("config.ini", "w") as f:
                 config.write(f)
+            logging.info("✅ Updated config file with new session token")
+        except Exception as e:
+            logging.error(f"⚠️  Failed to update config file: {e}")
+            # Don't fail the whole operation if config update fails
 
-            return True
-        else:
-            logging.error("❌ Failed to get valid session token")
-            return False
+        return True
 
     except Exception as e:
         logging.error(f"❌ Error ensuring valid session: {e}")
         return False
+
+    finally:
+        # Always release the lock if we have it
+        if session_auth:
+            session_auth.release_lock()
 
 
 def is_market_day() -> bool:
@@ -162,7 +185,7 @@ def is_post_market() -> bool:
     return Config.MARKET_CLOSE < now <= Config.POST_MARKET_CLOSE
 
 
-def check_and_generate_report(session) -> bool:
+def check_and_generate_report(session, trading_system: TradingSystem) -> bool:
     now = datetime.datetime.now()
     if not (is_market_day() and now.time() >= Config.REPORT_START_TIME):
         return True
@@ -174,9 +197,9 @@ def check_and_generate_report(session) -> bool:
         session.report_generated_today = True
         return True
     try:
-        trader.generate_daily_report()
+        trading_system.generate_daily_report()
         session.report_generated_today = True
-        trader.today_trades = []
+        trading_system.portfolio.today_trades = []
         return True
     except Exception as e:
         logging.error(f"Error generating report: {e}")
@@ -184,6 +207,13 @@ def check_and_generate_report(session) -> bool:
 
 
 def run_trading_cycle(session: TradingSession) -> None:
+    # initialize trading system from trader.py
+
+    trading_system = TradingSystem()
+    if not trading_system.initialize():
+        logging.error("❌ Failed to initialize trading system. Exiting.")
+        return
+
     """Execute one cycle of the trading strategy."""
     now = datetime.datetime.now()
 
@@ -200,16 +230,18 @@ def run_trading_cycle(session: TradingSession) -> None:
     )
 
     # Generate report
-    check_and_generate_report(session)
+    check_and_generate_report(session, trading_system)
 
     # Run strategy based on market conditions
     if Config.RUN_STRATEGY_OFF_HOURS:
-        run_test_mode(session, now)
+        run_test_mode(session, trading_system, now)
     else:
-        run_normal_mode(session, now)
+        run_normal_mode(session, trading_system, now)
 
 
-def run_test_mode(session: TradingSession, now: datetime.datetime) -> None:
+def run_test_mode(
+    session: TradingSession, trading_system: TradingSystem, now: datetime.datetime
+) -> None:
     """Run trading strategy in test mode."""
     logging.info("Test Mode: Active")
 
@@ -220,11 +252,13 @@ def run_test_mode(session: TradingSession, now: datetime.datetime) -> None:
         logging.info(
             f"Test Mode: Running strategy (Interval: {Config.TEST_MODE_STRATEGY_INTERVAL}s)"
         )
-        trader.run_strategy()
+        trading_system.run_strategy()
         session.last_run_time = now
 
 
-def run_normal_mode(session: TradingSession, now: datetime.datetime) -> None:
+def run_normal_mode(
+    session: TradingSession, trading_system: TradingSystem, now: datetime.datetime
+) -> None:
     """Run trading strategy in normal market mode."""
     if not is_market_day():
         return
@@ -233,8 +267,8 @@ def run_normal_mode(session: TradingSession, now: datetime.datetime) -> None:
     if is_pre_market() and not session.day_started:
         logging.info("Normal Mode: Pre-market preparation")
         session.day_started = True
-        trader.load_positions()
-        trader.load_today_trades()
+        trading_system.portfolio.load_positions()
+        trading_system.portfolio.load_today_trades()
 
     # Market hours
     elif is_during_market_hours():
@@ -246,7 +280,7 @@ def run_normal_mode(session: TradingSession, now: datetime.datetime) -> None:
             logging.info(
                 f"Normal Mode: Running strategy (Interval: {Config.NORMAL_MODE_STRATEGY_INTERVAL}s)"
             )
-            trader.run_strategy()
+            trading_system.run_strategy()
             session.last_run_time = now
 
     # Post-market
@@ -292,10 +326,6 @@ def run_continuously() -> None:
         logging.info("Trading system stopped by user")
     except Exception as e:
         logging.error(f"Fatal error in trading system: {e}", exc_info=True)
-        trader.send_email(
-            "Trading System Error",
-            f"A fatal error occurred: {str(e)}\n\nCheck logs for details.",
-        )
     finally:
         logging.info("Trading system shutdown complete")
 

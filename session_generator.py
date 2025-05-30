@@ -8,6 +8,7 @@ import json
 import urllib.parse
 import webbrowser
 import configparser
+import time
 from datetime import datetime, timedelta
 import os
 from utils.crypto_utils import decrypt_password
@@ -24,6 +25,8 @@ class ManualBreezeAuth:
     def __init__(self):
         self.api_key = API_KEY
         self.user_id = USER_ID
+        self.lock_file = os.path.abspath("session.lock")
+        self.lock_acquired = False
 
         # Decrypt the password when initializing
         try:
@@ -44,6 +47,37 @@ class ManualBreezeAuth:
         if not os.path.exists(self.session_file):
             with open(self.session_file, "w") as f:
                 json.dump({}, f)  # Initialize with empty JSON object
+                
+    def acquire_lock(self):
+        """Acquire a lock to prevent multiple session refresh attempts."""
+        if os.path.exists(self.lock_file):
+            # Check if lock is stale (older than 5 minutes)
+            lock_time = os.path.getmtime(self.lock_file)
+            if time.time() - lock_time > 300:  # 5 minutes
+                print("⚠️  Removing stale lock file")
+                try:
+                    os.remove(self.lock_file)
+                except:
+                    pass
+            else:
+                return False
+                
+        try:
+            with open(self.lock_file, 'w') as f:
+                f.write(str(os.getpid()))
+            self.lock_acquired = True
+            return True
+        except:
+            return False
+            
+    def release_lock(self):
+        """Release the session lock if we have it."""
+        if self.lock_acquired and os.path.exists(self.lock_file):
+            try:
+                os.remove(self.lock_file)
+                self.lock_acquired = False
+            except:
+                pass
 
     def save_session_token(self, session_token, hours_valid=8):
         """Save the session token to both JSON and config files"""
@@ -109,6 +143,12 @@ class ManualBreezeAuth:
         print("\n" + "=" * 60)
         print("📝 MANUAL ICICI BREEZE SESSION GENERATOR")
         print("=" * 60)
+        
+        # Check if another instance is already handling session generation
+        if not self.acquire_lock():
+            print("⚠️  Another session refresh is already in progress. Please complete that first.")
+            print(f"If you believe this is an error, delete the file: {self.lock_file}")
+            return None
 
         # Check existing session first
         existing_token, hours_left = self.check_existing_session()
