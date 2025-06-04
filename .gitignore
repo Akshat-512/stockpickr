@@ -7,3 +7,5 @@ reports
 trader.log
 continuous_trading.log
 config.ini
+session.json
+session.lock
