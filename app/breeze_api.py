@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from breeze_connect import BreezeConnect
-from stock_utils import stock_mapper
+from utils.stock_utils import stock_mapper
 from typing import Optional, Tuple, Dict, Any
 
 

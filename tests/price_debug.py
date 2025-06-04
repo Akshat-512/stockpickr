@@ -10,7 +10,7 @@ import logging
 import json
 import configparser
 from breeze_connect import BreezeConnect
-from stock_utils import stock_mapper
+from utils.stock_utils import stock_mapper
 
 # Configure logging
 logging.basicConfig(
